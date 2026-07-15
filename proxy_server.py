@@ -1,51 +1,38 @@
 from flask import Flask, request, jsonify
-import json
-import urllib.parse
-from datetime import datetime
-import os
 
 app = Flask(__name__)
 
-# 建立 log 目錄
-if not os.path.exists('logs'):
-    os.makedirs('logs')
-
-@app.route('/log', methods=['POST'])
-def proxy_log():
-    try:
-        data = request.get_json(force=True)
+@app.route('/api/lyrics', methods=['GET'])
+def get_lyrics():
+    video_id = request.args.get('v')
+    
+    print("========================================")
+    print(f"🌟 收到手機端歌詞請求！Video ID: {video_id}")
+    print("========================================")
+    
+    if not video_id:
+        return jsonify({"error": "Missing video ID"}), 400
         
-        url = data.get('url', 'Unknown URL')
-        request_body = data.get('request_body', '')
-        response_body = data.get('response_body', '')
-        req_type = data.get('type', '')
-        
-        # 為了避免洗頻，我們只關注跟歌詞或歌曲資訊有關的 API (例如 next 或是 browse)
-        if "next" in url or "browse" in url:
-            
-            timestamp = datetime.now().strftime("%H-%M-%S")
-            print(f"\n[{timestamp}] 🎯 攔截到關鍵 API: {url}")
-            
-            # 將 Request 儲存成檔案方便分析
-            with open(f"logs/{timestamp}_req.json", "w", encoding="utf-8") as f:
-                f.write(f"URL: {url}\n\n[REQUEST BODY]\n{request_body}\n\n[RESPONSE BODY]\n{response_body}")
-                
-            # 如果是 JSON 格式，我們試著在終端機漂亮地印出來
-            try:
-                if request_body.startswith('{'):
-                    req_json = json.loads(request_body)
-                    # 如果有 browseId，這很可能是歌詞請求！
-                    if "browseId" in req_json:
-                        print(f"🔥 發現 browseId: {req_json['browseId']}")
-            except:
-                pass
-                
-    except Exception as e:
-        print("Log 接收失敗:", e)
+    # TODO: 下一步我們會在這裡實作：
+    # 1. 用 yt-dlp 或是 YouTube 網頁爬蟲，透過 video_id 抓出「歌名」與「歌手」。
+    # 2. 將歌名傳給 Netease 或是 LRCLIB API 搜尋。
+    # 3. 解析回傳的雙語歌詞。
+    
+    # 目前我們先回傳一段假的測試歌詞，確認手機端能成功收到並蓋掉原本的畫面！
+    mock_lyrics = f"""[測試成功！成功攔截 Video ID: {video_id}]
+    
+如果這段文字出現在你的手機上，
+代表我們的 UI 覆寫技術完全成功了！🎉
 
-    return jsonify({"status": "ok"})
+Next step:
+我們將會在伺服器端把這個 ID 轉換成真實的雙語歌詞！
+"""
+
+    # 回傳給手機的 JSON 格式
+    return jsonify({
+        "translated_lyrics": mock_lyrics
+    })
 
 if __name__ == '__main__':
-    print("日誌伺服器已啟動: http://0.0.0.0:8000/log")
-    print("請在手機上操作 YouTube Music，所有 API 請求將會顯示在這裡並存入 logs 資料夾。")
+    print("API 伺服器已啟動: http://0.0.0.0:20016/api/lyrics")
     app.run(host='0.0.0.0', port=20016, debug=True)

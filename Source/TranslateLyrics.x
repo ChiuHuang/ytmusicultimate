@@ -1,83 +1,94 @@
-#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
-// 你指定的 Log Server 網址
-#define LOG_SERVER_URL @"https://ytmtranslate.chiuhuang.dev/log"
+// 宣告在 YTPlayerViewController 裡我們會用到的屬性
+@interface YTPlayerViewController : UIViewController
+@property (readonly, nonatomic) NSString *currentVideoID;
+@end
 
-// 輔助函數：將攔截到的資料非同步發送到我們的 Python 伺服器
-static void sendLogToServer(NSString *type, NSString *url, NSString *body, NSString *response) {
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:LOG_SERVER_URL]];
-    req.HTTPMethod = @"POST";
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    
-    NSDictionary *dict = @{
-        @"type": type ?: @"",
-        @"url": url ?: @"",
-        @"request_body": body ?: @"",
-        @"response_body": response ?: @""
-    };
-    
-    NSError *error;
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&error];
-    if (jsonData) {
-        req.HTTPBody = jsonData;
-        // 使用 sharedSession 發送 Log，不處理回應
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req] resume];
+// 宣告在 YTMLightweightMusicDescriptionShelfCell 裡會用到的東西
+@interface YTFormattedStringLabel : UILabel
+@end
+@interface YTMLightweightMusicDescriptionShelfCell : UIView
+@property (retain, nonatomic) UITextView *lyrics;
+@end
+
+// 全域變數，用來記錄目前正在播放的影片 ID 與歌詞快取
+static NSString *g_currentVideoID = nil;
+static NSMutableDictionary *g_lyricsCache = nil;
+
+// Hook 1: 當歌曲開始播放時，攔截影片 ID
+%hook YTPlayerViewController
+- (void)playbackController:(id)arg1 didActivateVideo:(id)arg2 withPlaybackData:(id)arg3 {
+    %orig;
+    if (self.currentVideoID) {
+        g_currentVideoID = self.currentVideoID;
     }
 }
+%end
 
-%hook NSURLSession
+// Hook 2: 攔截歌詞顯示的 Cell
+%hook YTMLightweightMusicDescriptionShelfCell
 
-// Hook 1: 攔截帶有 CompletionHandler 的請求 (很多現代 API 走這個)
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+- (void)setRenderer:(id)renderer {
+    %orig; // 先讓官方跑完原本的邏輯 (這時畫面會顯示原始歌詞)
     
-    NSString *urlString = request.URL.absoluteString;
+    YTFormattedStringLabel *descriptionLabel = [self valueForKey:@"_descriptionLabel"];
+    if (!descriptionLabel) return;
     
-    // 只攔截 youtubei 的 API
-    if ([urlString containsString:@"youtubei/v1"]) {
-        NSString *requestBody = @"";
-        if (request.HTTPBody) {
-            requestBody = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
-        }
-        
-        // 替換原本的 completionHandler 以攔截回傳 (Response) 的資料
-        void (^customCompletion)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            
-            NSString *responseData = @"";
-            if (data) {
-                responseData = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                // YouTube 有時候會回傳 Protobuf (二進位格式)，這時用 UTF8 會解不出來
-                if (!responseData) {
-                    responseData = [NSString stringWithFormat:@"[解析失敗可能是二進位或 Protobuf, 檔案大小: %lu bytes]", (unsigned long)data.length];
-                }
-            }
-            
-            // 把 Request 跟 Response 都送到我們的伺服器
-            sendLogToServer(@"completionHandler", urlString, requestBody, responseData);
-            
-            // 執行官方原本的 Callback，確保 App 正常運作
-            if (completionHandler) {
-                completionHandler(data, response, error);
-            }
-        };
-        
-        return %orig(request, customCompletion);
+    // 初始化快取
+    if (!g_lyricsCache) {
+        g_lyricsCache = [[NSMutableDictionary alloc] init];
     }
     
-    return %orig(request, completionHandler);
-}
-
-// Hook 2: 攔截使用 Delegate 的請求 (舊版或 Streaming API 可能走這個)
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    NSString *urlString = request.URL.absoluteString;
-    if ([urlString containsString:@"youtubei/v1"]) {
-        NSString *requestBody = @"";
-        if (request.HTTPBody) {
-            requestBody = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+    NSString *videoID = g_currentVideoID;
+    if (!videoID) return; // 如果不知道現在播什麼歌，就先放棄
+    
+    // 如果快取裡已經有這首歌的翻譯歌詞，直接替換
+    if (g_lyricsCache[videoID]) {
+        NSString *translatedText = g_lyricsCache[videoID];
+        descriptionLabel.text = translatedText;
+        
+        // 如果你有開啟 selectableLyrics，連同那個隱藏的 UITextView 也一起改
+        if ([self respondsToSelector:@selector(lyrics)] && self.lyrics) {
+            self.lyrics.text = translatedText;
         }
-        // 如果是 delegate，我們很難在這裡直接攔截 response，但至少先把 request 送過去
-        sendLogToServer(@"delegate", urlString, requestBody, @"[這筆請求走 Delegate 模式，無法直接在此取得 Response]");
+        return;
     }
-    return %orig;
+    
+    // 如果還沒抓過，偷偷發請求給你的伺服器
+    // 假設你的 Python 伺服器未來會有 /api/lyrics?v=... 的路徑
+    NSString *serverURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@", videoID];
+    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:serverURL]];
+    
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && data) {
+            // 嘗試解析伺服器回傳的 JSON
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            
+            // 假設你伺服器回傳的格式是 {"translated_lyrics": "雙語歌詞內容..."}
+            if (json && json[@"translated_lyrics"]) {
+                NSString *newLyrics = json[@"translated_lyrics"];
+                
+                // 存入快取，下次切回來就不用重抓
+                g_lyricsCache[videoID] = newLyrics;
+                
+                // 必須切換回 Main Thread (主執行緒) 才能更新 UI 畫面
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // 再次確認當前播放的歌還是一樣的，避免網路太慢，切歌了歌詞才回來
+                    if ([g_currentVideoID isEqualToString:videoID]) {
+                        descriptionLabel.text = newLyrics;
+                        
+                        if ([self respondsToSelector:@selector(lyrics)] && self.lyrics) {
+                            self.lyrics.text = newLyrics;
+                        }
+                        
+                        // 告訴視圖需要重繪以適應新的文字長度
+                        [self setNeedsLayout];
+                    }
+                });
+            }
+        }
+    }] resume];
 }
 
 %end
