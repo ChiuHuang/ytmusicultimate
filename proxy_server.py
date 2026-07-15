@@ -1,38 +1,51 @@
 from flask import Flask, request, jsonify
 import json
+import urllib.parse
+from datetime import datetime
+import os
 
 app = Flask(__name__)
 
-@app.route('/lyrics', methods=['POST', 'GET'])
-def proxy_lyrics():
-    print("====== 收到來自 YTMusicUltimate 的歌詞請求 ======")
-    
-    # 印出 YTMusic 傳送過來的 Headers
-    # print("Headers:", request.headers)
-    
-    # 嘗試解析 YTMusic 傳送過來的 JSON Body
-    try:
-        body = request.get_json(force=True)
-        # print("Body:", json.dumps(body, indent=2))
-        
-        # 通常 browseId 會放在 browseRequest 裡面，我們之後可以從這裡抓出歌曲資訊
-        # 例如 browseId = body.get('browseId')
-        
-    except Exception as e:
-        print("無法解析 Body:", e)
+# 建立 log 目錄
+if not os.path.exists('logs'):
+    os.makedirs('logs')
 
-    print("===============================================")
-    
-    # 為了測試手機端是否有成功收到攔截後的資料，我們隨便回傳一個假的回應 (JSON 格式)。
-    # 這裡的回傳格式目前不是 YTMusic 的標準格式，因為我們需要先抓到原本 YTMusic 真正的回傳格式才能模仿它。
-    # 下一步我們會教你怎麼抓包看 Youtube 真正的回傳格式。
-    return jsonify({
-        "status": "success",
-        "message": "這是一份從你的 Python 代理伺服器回傳的假歌詞！",
-        "proxy_active": True
-    })
+@app.route('/log', methods=['POST'])
+def proxy_log():
+    try:
+        data = request.get_json(force=True)
+        
+        url = data.get('url', 'Unknown URL')
+        request_body = data.get('request_body', '')
+        response_body = data.get('response_body', '')
+        req_type = data.get('type', '')
+        
+        # 為了避免洗頻，我們只關注跟歌詞或歌曲資訊有關的 API (例如 next 或是 browse)
+        if "next" in url or "browse" in url:
+            
+            timestamp = datetime.now().strftime("%H-%M-%S")
+            print(f"\n[{timestamp}] 🎯 攔截到關鍵 API: {url}")
+            
+            # 將 Request 儲存成檔案方便分析
+            with open(f"logs/{timestamp}_req.json", "w", encoding="utf-8") as f:
+                f.write(f"URL: {url}\n\n[REQUEST BODY]\n{request_body}\n\n[RESPONSE BODY]\n{response_body}")
+                
+            # 如果是 JSON 格式，我們試著在終端機漂亮地印出來
+            try:
+                if request_body.startswith('{'):
+                    req_json = json.loads(request_body)
+                    # 如果有 browseId，這很可能是歌詞請求！
+                    if "browseId" in req_json:
+                        print(f"🔥 發現 browseId: {req_json['browseId']}")
+            except:
+                pass
+                
+    except Exception as e:
+        print("Log 接收失敗:", e)
+
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
-    # 啟動伺服器在 Port 3000
-    print("伺服器已啟動: http://127.0.0.1:3000/lyrics")
-    app.run(host='0.0.0.0', port=3000, debug=True)
+    print("日誌伺服器已啟動: http://0.0.0.0:8000/log")
+    print("請在手機上操作 YouTube Music，所有 API 請求將會顯示在這裡並存入 logs 資料夾。")
+    app.run(host='0.0.0.0', port=20016, debug=True)
