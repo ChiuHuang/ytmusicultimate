@@ -108,6 +108,8 @@ static void sendDebugLog(NSString *msg) {
 @property (nonatomic, strong) NSArray *lyrics;
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, assign) NSInteger currentIndex;
+@property (nonatomic, assign) BOOL isLoading;
+@property (nonatomic, copy) NSString *loadingVideoID;
 - (void)updateLyrics:(NSArray *)newLyrics;
 - (void)fetchLyricsForVideo:(NSString *)videoID;
 @end
@@ -162,18 +164,31 @@ static void sendDebugLog(NSString *msg) {
 
 - (void)fetchLyricsForVideo:(NSString *)videoID {
     if (!g_lyricsCache) {
-        g_lyricsCache = [[NSMutableDictionary alloc] init];
+        g_lyricsCache = [[NSMutableDictionary alloc] init];\
     }
     
-    // Check Cache
+    // Check Cache first — instant return
     if (g_lyricsCache[videoID]) {
         [self updateLyrics:g_lyricsCache[videoID]];
         return;
     }
     
-    // Fetch JWT first (it will be cached after the first time)
-    [self updateLyrics:@[@{@"text": @"✨ Bypass Cloudflare Turnstile...", @"translated": @"驗證中...", @"time": @0}]];
+    // Dedup: if already loading this exact video, do nothing
+    if (self.isLoading && [self.loadingVideoID isEqualToString:videoID]) {
+        return;
+    }
+    self.isLoading = YES;
+    self.loadingVideoID = videoID;
+    
+    // Fetch JWT (cached after first time), then fetch lyrics
+    [self updateLyrics:@[@{@"text": @"✨ Getting lyrics...", @"translated": @"驗證中...", @"time": @0}]];
     [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
+        // Don't fetch if user already switched songs
+        if (![self.loadingVideoID isEqualToString:videoID]) {
+            self.isLoading = NO;
+            return;
+        }
+        
         NSString *serverURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@", videoID];
         if (jwt) {
             serverURL = [serverURL stringByAppendingFormat:@"&jwt=%@", jwt];
@@ -184,6 +199,9 @@ static void sendDebugLog(NSString *msg) {
         
         [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                self.isLoading = NO;
+                if (![self.loadingVideoID isEqualToString:videoID]) return; // stale
+                
                 if (error) {
                     [self updateLyrics:@[@{@"text": @"⚠️ 網路連線錯誤", @"translated": error.localizedDescription, @"time": @0}]];
                     return;

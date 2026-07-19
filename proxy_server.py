@@ -249,20 +249,15 @@ def get_song_info(video_id):
 
 
 def fetch_yt_lyrics(video_id):
-    """Fetch YouTube's own lyrics for a video."""
     try:
         ytm = get_ytmusic()
         watch_playlist = ytm.get_watch_playlist(video_id)
+        lyrics_browse_id = watch_playlist.get('lyrics') if watch_playlist else None
         
-        if not watch_playlist or 'lyrics' not in watch_playlist:
-            return None
-        
-        lyrics_browse_id = watch_playlist.get('lyrics')
-        if not lyrics_browse_id:
-    try:
-        lyrics = ytm.get_lyrics(video_id)
-        if lyrics and lyrics.get('lyrics'):
-            return {'plain': lyrics['lyrics'], 'source': 'YouTube Music'}
+        if lyrics_browse_id:
+            lyrics = ytm.get_lyrics(lyrics_browse_id)
+            if lyrics and lyrics.get('lyrics'):
+                return {'plain': lyrics['lyrics'], 'source': 'YouTube Music'}
     except Exception as e:
         print(f"  ❌ ytmusicapi error: {e}")
     return None

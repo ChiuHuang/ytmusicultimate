@@ -77,19 +77,22 @@
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://lyrics.api.dacubeking.com/verify-turnstile"]];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    NSDictionary *body = @{@"turnstileToken": token};
+    NSDictionary *body = @{@"token": token};
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if (json[@"jwtToken"]) {
-                self.jwtToken = json[@"jwtToken"];
-                NSLog(@"[YTMU-Turnstile] Got JWT!");
+            // Cubey API returns field "jwt"
+            NSString *jwtField = json[@"jwt"] ?: json[@"jwtToken"];
+            if (jwtField) {
+                self.jwtToken = jwtField;
+                NSLog(@"[YTMU-Turnstile] Got JWT! (field=%@)", json[@"jwt"] ? @"jwt" : @"jwtToken");
                 [self resolveHandlersWithToken:self.jwtToken];
                 return;
             }
         }
+        NSLog(@"[YTMU-Turnstile] JWT verification failed: %@", error);
         [self resolveHandlersWithToken:nil];
     }] resume];
 }
