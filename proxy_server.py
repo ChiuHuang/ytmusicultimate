@@ -496,70 +496,120 @@ def parse_ttml_time(time_str):
 
 
 # ============================================================
-# Google Translate
+# Cohere Translate (Command A Translate - free tier)
 # ============================================================
+
+COHERE_API_KEYS = [
+    "XlQ23B0II2OEgSO1sNa1mWXgiuMsuYcGWBAblLfX",
+    "8SNdZXeGNQwTLaZQz6bpHWKW5SnnujUbMBgpi1jJ",
+    "ZpSlGaleZDIWf5WnzJrxxz2fAEv26Xc7vdZgyqiz",
+    "gGIDUA29FUdmauU7rden49bWXRurTThqzbbBEqNy",
+]
+_cohere_key_idx = 0
 
 translate_cache = {}
 
-def google_translate(texts, target_lang='zh-TW'):
-    """Translate a list of text lines using Google Translate gtx endpoint."""
+def get_cohere_key():
+    global _cohere_key_idx
+    key = COHERE_API_KEYS[_cohere_key_idx % len(COHERE_API_KEYS)]
+    return key
+
+def rotate_cohere_key():
+    global _cohere_key_idx
+    _cohere_key_idx += 1
+    print(f"  [Cohere] Rotated to key index {_cohere_key_idx % len(COHERE_API_KEYS)}")
+
+LANG_NAMES = {
+    'zh-TW': 'Traditional Chinese',
+    'zh-CN': 'Simplified Chinese',
+    'ja': 'Japanese',
+    'ko': 'Korean',
+    'en': 'English',
+}
+
+def cohere_translate(texts, target_lang='zh-TW'):
+    """Translate a list of text lines using Cohere Command A Translate."""
     if not texts:
         return []
     
-    cache_key = f"{target_lang}:{hashlib.md5('|'.join(texts).encode()).hexdigest()}"
+    # Filter out lines that are already the target language or empty
+    # Simple heuristic: if all chars are CJK and target is zh, skip
+    non_empty = [t for t in texts if t.strip()]
+    if not non_empty:
+        return texts
+    
+    cache_key = f"cohere:{target_lang}:{hashlib.md5('|'.join(texts).encode()).hexdigest()}"
     if cache_key in translate_cache:
         return translate_cache[cache_key]
     
-    # Batch lines with delimiter
-    delimiter = '\n\n;\n\n'
-    batches = []
-    current_batch = []
-    current_len = 0
+    lang_name = LANG_NAMES.get(target_lang, target_lang)
     
-    for text in texts:
-        if current_len + len(text) + len(delimiter) > 4000:  # Keep batches small
-            batches.append(current_batch)
-            current_batch = []
-            current_len = 0
-        current_batch.append(text)
-        current_len += len(text) + len(delimiter)
+    # Join all lines with a numbered marker for reliable splitting
+    numbered = [f"[{i+1}] {t}" for i, t in enumerate(texts)]
+    joined = '\n'.join(numbered)
     
-    if current_batch:
-        batches.append(current_batch)
+    prompt = (
+        f"Translate the following song lyrics into {lang_name}. "
+        f"Keep the same numbered format [1], [2], etc. "
+        f"If a line is already in {lang_name} or is romanization/gibberish, keep it as-is. "
+        f"Return ONLY the translated lines with their numbers, nothing else.\n\n"
+        f"{joined}"
+    )
     
-    all_translations = []
-    
-    for batch in batches:
-        joined = delimiter.join(batch)
+    for attempt in range(len(COHERE_API_KEYS)):
         try:
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={quote(joined)}"
-            resp = requests.get(url, timeout=10,
-                              headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+            api_key = get_cohere_key()
+            resp = requests.post(
+                "https://api.cohere.com/v2/chat",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "command-a-translate-08-2025",
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30
+            )
             
-            if resp.status_code == 200:
-                data = resp.json()
-                translated = ''.join(part[0] for part in data[0] if part[0])
-                
-                # Split by delimiter
-                parts = translated.split(';')
-                if len(parts) == len(batch):
-                    all_translations.extend([p.strip() for p in parts])
-                else:
-                    # Fallback: split by lines
-                    trans_lines = translated.split('\n')
-                    trans_lines = [t.strip() for t in trans_lines if t.strip()]
-                    # Pad or trim to match
-                    while len(trans_lines) < len(batch):
-                        trans_lines.append('')
-                    all_translations.extend(trans_lines[:len(batch)])
-            else:
-                all_translations.extend(['' for _ in batch])
+            if resp.status_code == 429:  # Rate limited
+                print(f"  [Cohere] Rate limited on key {attempt}, rotating...")
+                rotate_cohere_key()
+                continue
+            
+            if resp.status_code != 200:
+                print(f"  [Cohere] Error {resp.status_code}: {resp.text[:200]}")
+                rotate_cohere_key()
+                continue
+            
+            data = resp.json()
+            translated_text = data['message']['content'][0]['text']
+            
+            # Parse numbered lines back
+            result_map = {}
+            for line in translated_text.split('\n'):
+                line = line.strip()
+                if line.startswith('['):
+                    try:
+                        bracket_end = line.index(']')
+                        idx = int(line[1:bracket_end])
+                        content = line[bracket_end+1:].strip()
+                        result_map[idx] = content
+                    except:
+                        pass
+            
+            # Reconstruct in order
+            results = [result_map.get(i+1, texts[i]) for i in range(len(texts))]
+            translate_cache[cache_key] = results
+            return results
+            
         except Exception as e:
-            print(f"[Translate] Error: {e}")
-            all_translations.extend(['' for _ in batch])
+            print(f"  [Cohere] Exception: {e}")
+            rotate_cohere_key()
     
-    translate_cache[cache_key] = all_translations
-    return all_translations
+    # Fallback: return originals
+    print(f"  [Cohere] All keys failed, returning originals")
+    return texts
 
 
 # ============================================================
@@ -583,6 +633,10 @@ def set_cached(video_id, data):
 # Main Lyrics Pipeline
 # ============================================================
 
+# Server-side in-flight dedup
+_in_flight = {}  # cache_key -> threading.Event
+import threading
+
 def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
     """Try all providers in priority order, return best result."""
     
@@ -601,6 +655,17 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
             print(f"  ✅ Cubey: synced LRC lyrics found from {cubey.get('source')}!")
             parsed = parse_lrc(cubey['synced'], duration)
             result = {'lyrics': parsed, 'source': cubey.get('source'), 'synced': True}
+            # Skip other providers - we already have the best
+            result['song'] = title
+            result['artist'] = artist
+            if translate_to and result.get('lyrics'):
+                print(f"  🌐 Translating {len(result['lyrics'])} lines with Cohere...")
+                texts = [l['text'] for l in result['lyrics'] if l.get('text')]
+                translations = cohere_translate(texts, translate_to)
+                for i, lyric in enumerate(result['lyrics']):
+                    if i < len(translations):
+                        lyric['translated'] = translations[i]
+            return result
     
     # Priority 1: LRCLIB (best for synced lyrics)
     print(f"  [1/3] Trying LRCLIB...")
@@ -664,9 +729,9 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
     
     # Translation
     if translate_to and result.get('lyrics'):
-        print(f"  🌐 Translating to {translate_to}...")
+        print(f"  🌐 Translating {len(result['lyrics'])} lines with Cohere...")
         texts = [l['text'] for l in result['lyrics'] if l.get('text')]
-        translations = google_translate(texts, translate_to)
+        translations = cohere_translate(texts, translate_to)
         
         for i, lyric in enumerate(result['lyrics']):
             if i < len(translations):
@@ -692,12 +757,25 @@ def api_lyrics():
     if not video_id:
         return jsonify({"error": "Missing video ID"}), 400
     
-    # Cache check
+    # Server-side in-flight dedup
     cache_key = f"{video_id}:{translate_to}"
+    if cache_key in _in_flight:
+        print(f"⏳ Waiting for in-flight request for {video_id}...")
+        _in_flight[cache_key].wait(timeout=30)
+        cached = get_cached(cache_key)
+        if cached:
+            print(f"✅ Got result from in-flight wait")
+            return jsonify(cached)
+    
+    # Cache check
     cached = get_cached(cache_key)
     if cached:
         print(f"✅ Cache hit!")
         return jsonify(cached)
+    
+    # Mark as in-flight
+    event = threading.Event()
+    _in_flight[cache_key] = event
     
     # Get song info
     print(f"🔍 Looking up song info...")
@@ -712,7 +790,13 @@ def api_lyrics():
     print(f"🎵 {song_info['title']} - {song_info['artist']} ({song_info['duration']}s)")
     
     # Fetch lyrics from all providers
-    result = fetch_all_lyrics(video_id, song_info, translate_to, jwt_token)
+    try:
+        result = fetch_all_lyrics(video_id, song_info, translate_to, jwt_token)
+    finally:
+        # Always release the in-flight lock
+        if cache_key in _in_flight:
+            _in_flight[cache_key].set()
+            del _in_flight[cache_key]
     
     # Cache result
     set_cached(cache_key, result)
@@ -754,7 +838,7 @@ if __name__ == '__main__':
     print("  1. LRCLIB     (synced + plain, free)")
     print("  2. Unison     (community, free)")
     print("  3. YT Music   (plain, via ytmusicapi)")
-    print("Translation: Google Translate (gtx)")
+    print("Translation: Cohere Command A Translate")
     print("Auth: Cloudflare Turnstile via in-app WKWebView")
     print("=" * 60)
     print("Server: http://0.0.0.0:20016")
