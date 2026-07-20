@@ -507,7 +507,27 @@ COHERE_API_KEYS = [
 ]
 _cohere_key_idx = 0
 
-translate_cache = {}
+import os
+os.makedirs('cache/lyrics', exist_ok=True)
+os.makedirs('cache/translate', exist_ok=True)
+
+def get_translate_cached(cache_key):
+    path = f"cache/translate/{hashlib.md5(cache_key.encode()).hexdigest()}.json"
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return None
+
+def set_translate_cached(cache_key, data):
+    path = f"cache/translate/{hashlib.md5(cache_key.encode()).hexdigest()}.json"
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except:
+        pass
 
 def get_cohere_key():
     global _cohere_key_idx
@@ -539,8 +559,9 @@ def cohere_translate(texts, target_lang='zh-TW'):
         return texts
     
     cache_key = f"cohere:{target_lang}:{hashlib.md5('|'.join(texts).encode()).hexdigest()}"
-    if cache_key in translate_cache:
-        return translate_cache[cache_key]
+    cached = get_translate_cached(cache_key)
+    if cached is not None:
+        return cached
     
     lang_name = LANG_NAMES.get(target_lang, target_lang)
     
@@ -552,6 +573,7 @@ def cohere_translate(texts, target_lang='zh-TW'):
         f"Translate the following song lyrics into {lang_name}. "
         f"Keep the same numbered format [1], [2], etc. "
         f"These are song lyrics, so keep the poetic style and meaning intact. "
+        f"IMPORTANT: Do not translate onomatopoeia, scat singing, or nonsense words (like 'ba ba', 'la la') literally. Leave them as-is or transliterate them. "
         f"If a line is already in {lang_name} or is romanization/gibberish, keep it as-is. "
         f"Return ONLY the translated lines with their numbers, nothing else.\n\n"
         f"{joined}"
@@ -601,8 +623,7 @@ def cohere_translate(texts, target_lang='zh-TW'):
             
             # Reconstruct in order
             results = [result_map.get(i+1, texts[i]) for i in range(len(texts))]
-            translate_cache[cache_key] = results
-            save_cache()
+            set_translate_cached(cache_key, results)
             return results
             
         except Exception as e:
@@ -620,8 +641,9 @@ def google_translate_fast(texts, target_lang='zh-TW'):
         return []
     
     cache_key = f"gtx:{target_lang}:{hashlib.md5('|'.join(texts).encode()).hexdigest()}"
-    if cache_key in translate_cache:
-        return translate_cache[cache_key]
+    cached = get_translate_cached(cache_key)
+    if cached is not None:
+        return cached
     
     delimiter = '\n\n;\n\n'
     batches, current_batch, current_len = [], [], 0
@@ -655,8 +677,7 @@ def google_translate_fast(texts, target_lang='zh-TW'):
         except Exception as e:
             all_translations.extend(['' for _ in batch])
     
-    translate_cache[cache_key] = all_translations
-    save_cache()
+    set_translate_cached(cache_key, all_translations)
     return all_translations
 
 
@@ -664,49 +685,26 @@ def google_translate_fast(texts, target_lang='zh-TW'):
 # Cache
 # ============================================================
 
-lyrics_cache = {}
-
-CACHE_FILE = 'lyrics_cache.json'
-TRANSLATE_CACHE_FILE = 'translate_cache.json'
-
-def load_cache():
-    global lyrics_cache, translate_cache
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                for k, v in loaded.items():
-                    lyrics_cache[k] = {'data': v['data'], 'ts': datetime.fromisoformat(v['ts'])}
-        if os.path.exists(TRANSLATE_CACHE_FILE):
-            with open(TRANSLATE_CACHE_FILE, 'r', encoding='utf-8') as f:
-                for k, v in json.load(f).items():
-                    translate_cache[k] = v
-        print(f"Loaded {len(lyrics_cache)} lyrics and {len(translate_cache)} translations from cache.")
-    except Exception as e:
-        print(f"Error loading cache: {e}")
-
-def save_cache():
-    try:
-        serializable_lyrics = {}
-        for k, v in lyrics_cache.items():
-            serializable_lyrics[k] = {'data': v['data'], 'ts': v['ts'].isoformat()}
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable_lyrics, f, ensure_ascii=False)
-        with open(TRANSLATE_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(translate_cache, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error saving cache: {e}")
-
 def get_cached(video_id):
-    if video_id in lyrics_cache:
-        entry = lyrics_cache[video_id]
-        if (datetime.now() - entry['ts']).total_seconds() < 86400 * 3: # Cache for 3 days
-            return entry['data']
+    path = f"cache/lyrics/{video_id}.json"
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                entry = json.load(f)
+            ts = datetime.fromisoformat(entry['ts'])
+            if (datetime.now() - ts).total_seconds() < 86400 * 3:
+                return entry['data']
+        except:
+            pass
     return None
 
 def set_cached(video_id, data):
-    lyrics_cache[video_id] = {'data': data, 'ts': datetime.now()}
-    save_cache()
+    path = f"cache/lyrics/{video_id}.json"
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'data': data, 'ts': datetime.now().isoformat()}, f, ensure_ascii=False)
+    except:
+        pass
 
 
 # ============================================================
@@ -963,7 +961,6 @@ def proxy_log():
 
 
 if __name__ == '__main__':
-    load_cache()
     print("=" * 60)
     print("🎵 YTMusic Ultimate - Lyrics API Server")
     print("=" * 60)
