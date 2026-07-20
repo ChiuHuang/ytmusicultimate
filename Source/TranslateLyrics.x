@@ -6,6 +6,9 @@
 - (double)currentMediaTime;
 @end
 
+// Global current time updated by player hook
+static double g_currentPlaybackTime = 0.0;
+
 @interface YTFormattedStringLabel : UILabel
 @end
 
@@ -30,12 +33,19 @@ static void sendDebugLog(NSString *msg) {
 - (void)playbackController:(id)arg1 didActivateVideo:(id)arg2 withPlaybackData:(id)arg3 {
     %orig;
     g_activePlayer = self;
+    g_currentPlaybackTime = 0.0;
     if (self.currentVideoID) {
         if (![self.currentVideoID isEqualToString:g_currentVideoID]) {
             g_currentVideoID = self.currentVideoID;
             [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMUSongDidChange" object:g_currentVideoID];
         }
     }
+}
+
+// Hook playback time updates — YTMusic calls this every ~0.1s
+- (void)playbackController:(id)arg1 didReceivePlaybackPositionTime:(double)time {
+    %orig;
+    g_currentPlaybackTime = time;
 }
 %end
 
@@ -221,18 +231,9 @@ static void sendDebugLog(NSString *msg) {
 }
 
 - (void)updatePlaybackTime {
-    if (!g_activePlayer || self.lyrics.count == 0 || self.lyrics.count == 1) return;
+    if (self.lyrics.count <= 1) return;
     
-    double currentTime = 0;
-    
-    // Attempt to get current media time
-    if ([g_activePlayer respondsToSelector:@selector(currentMediaTime)]) {
-        currentTime = [g_activePlayer currentMediaTime];
-    } else if ([g_activePlayer respondsToSelector:@selector(currentTime)]) {
-        // Fallback for some player architectures
-        currentTime = ((double (*)(id, SEL))objc_msgSend)(g_activePlayer, @selector(currentTime));
-    }
-    
+    double currentTime = g_currentPlaybackTime;
     if (currentTime <= 0) return;
     
     NSInteger newIndex = -1;
