@@ -136,6 +136,11 @@ static void sendDebugLog(NSString *msg) {
 @property (nonatomic, copy) NSString *loadingVideoID;
 - (void)updateLyrics:(NSArray *)newLyrics;
 - (void)fetchLyricsForVideo:(NSString *)videoID;
+- (void)forceReloadLyrics;
+@end
+
+@interface YTPlayerViewController (YTMU_Lyrics)
+- (CGFloat)currentVideoMediaTime;
 @end
 
 @implementation YTMULyricsViewController
@@ -165,6 +170,18 @@ static void sendDebugLog(NSString *msg) {
     statusLabel.font = [UIFont systemFontOfSize:14];
     statusLabel.tag = 8888;
     [header addSubview:statusLabel];
+    
+    UIButton *reloadBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    reloadBtn.frame = CGRectMake(self.view.bounds.size.width - 110, 80, 90, 36);
+    reloadBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [reloadBtn setTitle:@"🔄 Reload" forState:UIControlStateNormal];
+    [reloadBtn setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.9] forState:UIControlStateNormal];
+    reloadBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    reloadBtn.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15];
+    reloadBtn.layer.cornerRadius = 18;
+    [reloadBtn addTarget:self action:@selector(forceReloadLyrics) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:reloadBtn];
+    
     self.tableView.tableHeaderView = header;
     
     // Footer for bottom spacing
@@ -280,7 +297,13 @@ static void sendDebugLog(NSString *msg) {
 - (void)updatePlaybackTime {
     if (self.lyrics.count <= 1) return;
     
-    double currentTime = g_currentPlaybackTime;
+    double currentTime = 0;
+    if (g_activePlayer && [g_activePlayer respondsToSelector:@selector(currentVideoMediaTime)]) {
+        currentTime = [g_activePlayer currentVideoMediaTime];
+    } else {
+        currentTime = g_currentPlaybackTime;
+    }
+    
     if (currentTime <= 0) return;
     
     NSInteger newIndex = -1;
@@ -316,6 +339,56 @@ static void sendDebugLog(NSString *msg) {
         NSIndexPath *indexPath = [NSIndexPath indexPathForRow:newIndex inSection:0];
         [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:UITableViewScrollPositionMiddle animated:YES];
     }
+}
+
+- (void)forceReloadLyrics {
+    if (!g_currentVideoID) return;
+    
+    // Clear local cache
+    if (g_lyricsCache) {
+        [g_lyricsCache removeObjectForKey:g_currentVideoID];
+    }
+    self.lyrics = @[];
+    [self.tableView reloadData];
+    
+    UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
+    statusLabel.text = @"🔄 Force Reloading & Retranslating...";
+    
+    self.isLoading = YES;
+    self.loadingVideoID = g_currentVideoID;
+    
+    [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
+        if (![self.loadingVideoID isEqualToString:g_currentVideoID]) {
+            self.isLoading = NO;
+            return;
+        }
+        
+        NSString *fullURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@&force=1", g_currentVideoID];
+        if (jwt) {
+            fullURL = [fullURL stringByAppendingFormat:@"&jwt=%@", jwt];
+        }
+        
+        [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:fullURL] completionHandler:^(NSData *fullData, NSURLResponse *fullRes, NSError *fullErr) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.isLoading = NO;
+                if (![self.loadingVideoID isEqualToString:g_currentVideoID]) return;
+                
+                if (fullData && !fullErr) {
+                    NSDictionary *fullDict = [NSJSONSerialization JSONObjectWithData:fullData options:0 error:nil];
+                    if (fullDict && fullDict[@"lyrics"]) {
+                        statusLabel.text = @"";
+                        if (!g_lyricsCache) g_lyricsCache = [[NSMutableDictionary alloc] init];
+                        g_lyricsCache[g_currentVideoID] = fullDict[@"lyrics"];
+                        [self updateLyrics:fullDict[@"lyrics"]];
+                    } else {
+                        statusLabel.text = @"⚠️ 重譯失敗 / Force failed";
+                    }
+                } else {
+                    statusLabel.text = @"⚠️ 網路錯誤 / Network error";
+                }
+            });
+        }] resume];
+    }];
 }
 
 - (void)updateLyrics:(NSArray *)newLyrics {

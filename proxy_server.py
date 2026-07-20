@@ -868,9 +868,11 @@ def api_lyrics():
     translate_to = request.args.get('lang', 'zh-TW')
     jwt_token = request.args.get('jwt')
     fast_mode = request.args.get('fast', '0') == '1'
+    force_mode = request.args.get('force', '0') == '1'
     
     print("=" * 60)
     mode_str = 'FAST' if fast_mode else ('JWT+Cohere' if jwt_token else 'Normal')
+    if force_mode: mode_str += ' [FORCE]'
     print(f"🌟 Lyrics request: {video_id} [{mode_str}]")
     print("=" * 60)
     
@@ -879,7 +881,7 @@ def api_lyrics():
     
     # Separate cache keys for fast vs full results
     cache_key = f"{video_id}:{translate_to}:fast" if fast_mode else f"{video_id}:{translate_to}"
-    if cache_key in _in_flight:
+    if not force_mode and cache_key in _in_flight:
         print(f"⏳ Waiting for in-flight request for {video_id}...")
         _in_flight[cache_key].wait(timeout=30)
         cached = get_cached(cache_key)
@@ -888,10 +890,11 @@ def api_lyrics():
             return jsonify(cached)
     
     # Cache check
-    cached = get_cached(cache_key)
-    if cached:
-        print(f"✅ Cache hit!")
-        return jsonify(cached)
+    if not force_mode:
+        cached = get_cached(cache_key)
+        if cached:
+            print(f"✅ Cache hit!")
+            return jsonify(cached)
     
     # Mark as in-flight
     event = threading.Event()
