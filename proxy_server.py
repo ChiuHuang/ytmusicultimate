@@ -601,6 +601,7 @@ def cohere_translate(texts, target_lang='zh-TW'):
             # Reconstruct in order
             results = [result_map.get(i+1, texts[i]) for i in range(len(texts))]
             translate_cache[cache_key] = results
+            save_cache()
             return results
             
         except Exception as e:
@@ -654,6 +655,7 @@ def google_translate_fast(texts, target_lang='zh-TW'):
             all_translations.extend(['' for _ in batch])
     
     translate_cache[cache_key] = all_translations
+    save_cache()
     return all_translations
 
 
@@ -663,15 +665,47 @@ def google_translate_fast(texts, target_lang='zh-TW'):
 
 lyrics_cache = {}
 
+CACHE_FILE = 'lyrics_cache.json'
+TRANSLATE_CACHE_FILE = 'translate_cache.json'
+
+def load_cache():
+    global lyrics_cache, translate_cache
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                for k, v in loaded.items():
+                    lyrics_cache[k] = {'data': v['data'], 'ts': datetime.fromisoformat(v['ts'])}
+        if os.path.exists(TRANSLATE_CACHE_FILE):
+            with open(TRANSLATE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                for k, v in json.load(f).items():
+                    translate_cache[k] = v
+        print(f"Loaded {len(lyrics_cache)} lyrics and {len(translate_cache)} translations from cache.")
+    except Exception as e:
+        print(f"Error loading cache: {e}")
+
+def save_cache():
+    try:
+        serializable_lyrics = {}
+        for k, v in lyrics_cache.items():
+            serializable_lyrics[k] = {'data': v['data'], 'ts': v['ts'].isoformat()}
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable_lyrics, f, ensure_ascii=False)
+        with open(TRANSLATE_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(translate_cache, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error saving cache: {e}")
+
 def get_cached(video_id):
     if video_id in lyrics_cache:
         entry = lyrics_cache[video_id]
-        if (datetime.now() - entry['ts']).total_seconds() < 3600:
+        if (datetime.now() - entry['ts']).total_seconds() < 86400 * 3: # Cache for 3 days
             return entry['data']
     return None
 
 def set_cached(video_id, data):
     lyrics_cache[video_id] = {'data': data, 'ts': datetime.now()}
+    save_cache()
 
 
 # ============================================================
@@ -928,6 +962,7 @@ def proxy_log():
 
 
 if __name__ == '__main__':
+    load_cache()
     print("=" * 60)
     print("🎵 YTMusic Ultimate - Lyrics API Server")
     print("=" * 60)
