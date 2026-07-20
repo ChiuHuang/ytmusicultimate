@@ -551,6 +551,7 @@ def cohere_translate(texts, target_lang='zh-TW'):
     prompt = (
         f"Translate the following song lyrics into {lang_name}. "
         f"Keep the same numbered format [1], [2], etc. "
+        f"These are song lyrics, so keep the poetic style and meaning intact. "
         f"If a line is already in {lang_name} or is romanization/gibberish, keep it as-is. "
         f"Return ONLY the translated lines with their numbers, nothing else.\n\n"
         f"{joined}"

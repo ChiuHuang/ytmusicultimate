@@ -153,14 +153,27 @@ static void sendDebugLog(NSString *msg) {
     self.tableView.backgroundColor = [UIColor clearColor];
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.tableView.contentInset = UIEdgeInsetsMake(120, 0, 180, 0);
     self.tableView.showsVerticalScrollIndicator = NO;
+    
+    // Header for top spacing and status label
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 120)];
+    header.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    UILabel *statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 80, self.view.bounds.size.width, 40)];
+    statusLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    statusLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.7];
+    statusLabel.textAlignment = NSTextAlignmentCenter;
+    statusLabel.font = [UIFont systemFontOfSize:14];
+    statusLabel.tag = 8888;
+    [header addSubview:statusLabel];
+    self.tableView.tableHeaderView = header;
+    
+    // Footer for bottom spacing
+    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 180)];
+    self.tableView.tableFooterView = footer;
     
     [self.view addSubview:self.tableView];
     
-    self.lyrics = @[
-        @{@"text": @"✨ Loading lyrics...", @"translated": @"正在載入歌詞...", @"time": @0}
-    ];
+    self.lyrics = @[];
     
     // Listen for song changes
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleSongChange:) name:@"YTMUSongDidChange" object:nil];
@@ -179,10 +192,13 @@ static void sendDebugLog(NSString *msg) {
     NSString *videoID = notif.object;
     if (videoID) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Don't clear lyrics if it's the same song restoring
+            // Reset index but keep lyrics array intact for smooth transition
             if (![self.loadingVideoID isEqualToString:videoID]) {
                 self.currentIndex = -1;
-                [self updateLyrics:@[@{@"text": @"✨ Loading lyrics...", @"translated": @"正在載入歌詞...", @"time": @0}]];
+                UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
+                statusLabel.text = @"✨ Loading lyrics...";
+                self.lyrics = @[];
+                [self.tableView reloadData];
             }
             [self fetchLyricsForVideo:videoID];
         });
@@ -196,6 +212,8 @@ static void sendDebugLog(NSString *msg) {
     
     // Check Cache first
     if (g_lyricsCache[videoID]) {
+        UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
+        statusLabel.text = @""; // Clear indicator
         [self updateLyrics:g_lyricsCache[videoID]];
         return;
     }
@@ -206,14 +224,8 @@ static void sendDebugLog(NSString *msg) {
     self.isLoading = YES;
     self.loadingVideoID = videoID;
     
-    // Show top indicator without clearing old lyrics
-    NSMutableArray *current = [self.lyrics mutableCopy] ?: [NSMutableArray array];
-    if (current.count > 0) {
-        current[0] = @{@"text": @"🔍 Finding Live Lyrics...", @"translated": @"背景取得中...", @"time": @0};
-        [self updateLyrics:current];
-    } else {
-        [self updateLyrics:@[@{@"text": @"🔍 Finding Live Lyrics...", @"translated": @"背景取得中...", @"time": @0}]];
-    }
+    UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
+    statusLabel.text = @"🔍 Finding Live Lyrics...";
     
     // Step 1: Fast Request (LRCLIB + GTX)
     NSString *fastURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@&fast=1", videoID];
@@ -223,12 +235,9 @@ static void sendDebugLog(NSString *msg) {
             if (data && !err) {
                 NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                 if (dict && dict[@"lyrics"]) {
-                    // Temporarily show fast lyrics, but keep the loading indicator at the top if we haven't loaded full yet
-                    NSMutableArray *fastLyrics = [dict[@"lyrics"] mutableCopy];
-                    if (fastLyrics.count > 0) {
-                        fastLyrics[0] = @{@"text": fastLyrics[0][@"text"], @"translated": @"(Fast) 🔍 Finding Pro Lyrics...", @"time": fastLyrics[0][@"time"]};
-                    }
-                    [self updateLyrics:fastLyrics];
+                    // Show fast lyrics, keep pro indicator
+                    statusLabel.text = @"⚡️ Fast Lyrics loaded. Finding Pro...";
+                    [self updateLyrics:dict[@"lyrics"]];
                 }
             }
             
@@ -252,10 +261,13 @@ static void sendDebugLog(NSString *msg) {
                         if (fullData && !fullErr) {
                             NSDictionary *fullDict = [NSJSONSerialization JSONObjectWithData:fullData options:0 error:nil];
                             if (fullDict && fullDict[@"lyrics"]) {
+                                statusLabel.text = @""; // Clear indicator
                                 g_lyricsCache[videoID] = fullDict[@"lyrics"];
                                 [self updateLyrics:fullDict[@"lyrics"]];
-                            } else if (!g_lyricsCache[videoID]) { // Only show error if fast also failed
-                                [self updateLyrics:@[@{@"text": @"⚠️ 找不到歌詞", @"translated": @"No lyrics found", @"time": @0}]];
+                            } else if (!g_lyricsCache[videoID]) {
+                                statusLabel.text = @"⚠️ 找不到歌詞 / No lyrics found";
+                                self.lyrics = @[];
+                                [self.tableView reloadData];
                             }
                         }
                     });
