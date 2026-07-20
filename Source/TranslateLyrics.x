@@ -38,6 +38,9 @@ static void sendDebugLog(NSString *msg) {
         if (![self.currentVideoID isEqualToString:g_currentVideoID]) {
             g_currentVideoID = self.currentVideoID;
             [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMUSongDidChange" object:g_currentVideoID];
+        } else {
+            // Re-broadcast so panel loads on restore
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMUSongDidChange" object:g_currentVideoID];
         }
     }
 }
@@ -46,6 +49,17 @@ static void sendDebugLog(NSString *msg) {
 - (void)playbackController:(id)arg1 didReceivePlaybackPositionTime:(double)time {
     %orig;
     g_currentPlaybackTime = time;
+}
+%end
+
+%hook YTAppDelegate
+- (BOOL)application:(id)app didFinishLaunchingWithOptions:(id)options {
+    BOOL result = %orig;
+    // Pre-warm the JWT token in background at launch
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:nil];
+    });
+    return result;
 }
 %end
 
@@ -165,8 +179,11 @@ static void sendDebugLog(NSString *msg) {
     NSString *videoID = notif.object;
     if (videoID) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.currentIndex = -1;
-            [self updateLyrics:@[@{@"text": @"✨ Loading lyrics...", @"translated": @"正在載入歌詞...", @"time": @0}]];
+            // Don't clear lyrics if it's the same song restoring
+            if (![self.loadingVideoID isEqualToString:videoID]) {
+                self.currentIndex = -1;
+                [self updateLyrics:@[@{@"text": @"✨ Loading lyrics...", @"translated": @"正在載入歌詞...", @"time": @0}]];
+            }
             [self fetchLyricsForVideo:videoID];
         });
     }
@@ -174,60 +191,78 @@ static void sendDebugLog(NSString *msg) {
 
 - (void)fetchLyricsForVideo:(NSString *)videoID {
     if (!g_lyricsCache) {
-        g_lyricsCache = [[NSMutableDictionary alloc] init];\
+        g_lyricsCache = [[NSMutableDictionary alloc] init];
     }
     
-    // Check Cache first — instant return
+    // Check Cache first
     if (g_lyricsCache[videoID]) {
         [self updateLyrics:g_lyricsCache[videoID]];
         return;
     }
     
-    // Dedup: if already loading this exact video, do nothing
     if (self.isLoading && [self.loadingVideoID isEqualToString:videoID]) {
         return;
     }
     self.isLoading = YES;
     self.loadingVideoID = videoID;
     
-    // Fetch JWT (cached after first time), then fetch lyrics
-    [self updateLyrics:@[@{@"text": @"✨ Getting lyrics...", @"translated": @"驗證中...", @"time": @0}]];
-    [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
-        // Don't fetch if user already switched songs
-        if (![self.loadingVideoID isEqualToString:videoID]) {
-            self.isLoading = NO;
-            return;
-        }
-        
-        NSString *serverURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@", videoID];
-        if (jwt) {
-            serverURL = [serverURL stringByAppendingFormat:@"&jwt=%@", jwt];
-        }
-        
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:serverURL]];
-        req.HTTPMethod = @"GET";
-        
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.isLoading = NO;
-                if (![self.loadingVideoID isEqualToString:videoID]) return; // stale
-                
-                if (error) {
-                    [self updateLyrics:@[@{@"text": @"⚠️ 網路連線錯誤", @"translated": error.localizedDescription, @"time": @0}]];
+    // Show top indicator without clearing old lyrics
+    NSMutableArray *current = [self.lyrics mutableCopy] ?: [NSMutableArray array];
+    if (current.count > 0) {
+        current[0] = @{@"text": @"🔍 Finding Live Lyrics...", @"translated": @"背景取得中...", @"time": @0};
+        [self updateLyrics:current];
+    } else {
+        [self updateLyrics:@[@{@"text": @"🔍 Finding Live Lyrics...", @"translated": @"背景取得中...", @"time": @0}]];
+    }
+    
+    // Step 1: Fast Request (LRCLIB + GTX)
+    NSString *fastURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@&fast=1", videoID];
+    [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:fastURL] completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![self.loadingVideoID isEqualToString:videoID]) return;
+            if (data && !err) {
+                NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if (dict && dict[@"lyrics"]) {
+                    // Temporarily show fast lyrics, but keep the loading indicator at the top if we haven't loaded full yet
+                    NSMutableArray *fastLyrics = [dict[@"lyrics"] mutableCopy];
+                    if (fastLyrics.count > 0) {
+                        fastLyrics[0] = @{@"text": fastLyrics[0][@"text"], @"translated": @"(Fast) 🔍 Finding Pro Lyrics...", @"time": fastLyrics[0][@"time"]};
+                    }
+                    [self updateLyrics:fastLyrics];
+                }
+            }
+            
+            // Step 2: Full Request (Cubey + Cohere) using JWT
+            [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
+                if (![self.loadingVideoID isEqualToString:videoID]) {
+                    self.isLoading = NO;
                     return;
                 }
-                if (data) {
-                    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                    if (dict && dict[@"lyrics"]) {
-                        g_lyricsCache[videoID] = dict[@"lyrics"]; // Save to Cache
-                        [self updateLyrics:dict[@"lyrics"]];
-                    } else {
-                        [self updateLyrics:@[@{@"text": @"⚠️ 找不到歌詞", @"translated": @"No lyrics found", @"time": @0}]];
-                    }
+                
+                NSString *fullURL = [NSString stringWithFormat:@"https://ytmtranslate.chiuhuang.dev/api/lyrics?v=%@", videoID];
+                if (jwt) {
+                    fullURL = [fullURL stringByAppendingFormat:@"&jwt=%@", jwt];
                 }
-            });
-        }] resume];
-    }];
+                
+                [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:fullURL] completionHandler:^(NSData *fullData, NSURLResponse *fullRes, NSError *fullErr) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.isLoading = NO;
+                        if (![self.loadingVideoID isEqualToString:videoID]) return;
+                        
+                        if (fullData && !fullErr) {
+                            NSDictionary *fullDict = [NSJSONSerialization JSONObjectWithData:fullData options:0 error:nil];
+                            if (fullDict && fullDict[@"lyrics"]) {
+                                g_lyricsCache[videoID] = fullDict[@"lyrics"];
+                                [self updateLyrics:fullDict[@"lyrics"]];
+                            } else if (!g_lyricsCache[videoID]) { // Only show error if fast also failed
+                                [self updateLyrics:@[@{@"text": @"⚠️ 找不到歌詞", @"translated": @"No lyrics found", @"time": @0}]];
+                            }
+                        }
+                    });
+                }] resume];
+            }];
+        });
+    }] resume];
 }
 
 - (void)updatePlaybackTime {

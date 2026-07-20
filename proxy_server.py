@@ -612,6 +612,51 @@ def cohere_translate(texts, target_lang='zh-TW'):
     return texts
 
 
+def google_translate_fast(texts, target_lang='zh-TW'):
+    """Fast Google translate - no API key needed, for immediate results."""
+    if not texts:
+        return []
+    
+    cache_key = f"gtx:{target_lang}:{hashlib.md5('|'.join(texts).encode()).hexdigest()}"
+    if cache_key in translate_cache:
+        return translate_cache[cache_key]
+    
+    delimiter = '\n\n;\n\n'
+    batches, current_batch, current_len = [], [], 0
+    for text in texts:
+        if current_len + len(text) > 3500:
+            batches.append(current_batch)
+            current_batch, current_len = [], 0
+        current_batch.append(text)
+        current_len += len(text)
+    if current_batch:
+        batches.append(current_batch)
+    
+    all_translations = []
+    for batch in batches:
+        joined = delimiter.join(batch)
+        try:
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={quote(joined)}"
+            resp = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code == 200:
+                data = resp.json()
+                translated = ''.join(part[0] for part in data[0] if part[0])
+                parts = translated.split(';')
+                if len(parts) == len(batch):
+                    all_translations.extend([p.strip() for p in parts])
+                else:
+                    lines = [t.strip() for t in translated.split('\n') if t.strip()]
+                    while len(lines) < len(batch): lines.append('')
+                    all_translations.extend(lines[:len(batch)])
+            else:
+                all_translations.extend(['' for _ in batch])
+        except Exception as e:
+            all_translations.extend(['' for _ in batch])
+    
+    translate_cache[cache_key] = all_translations
+    return all_translations
+
+
 # ============================================================
 # Cache
 # ============================================================
@@ -636,6 +681,46 @@ def set_cached(video_id, data):
 # Server-side in-flight dedup
 _in_flight = {}  # cache_key -> threading.Event
 import threading
+
+def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
+    """Fast path: LRCLIB only + Google translate. Returns in ~1-2s."""
+    title = song_info['title']
+    artist = song_info['artist']
+    album = song_info.get('album', '')
+    duration = song_info.get('duration', 0)
+    result = None
+
+    lrc = fetch_lrclib(title, artist, album, duration)
+    if lrc:
+        if lrc.get('instrumental'):
+            result = {'lyrics': [{'time': 0, 'text': '🎵 Instrumental', 'translated': '純音樂', 'duration': 0}], 'source': 'LRCLib', 'synced': False}
+        elif lrc.get('synced'):
+            print(f"  [fast] ✅ LRCLIB synced!")
+            result = {'lyrics': parse_lrc(lrc['synced'], duration), 'source': 'LRCLib', 'synced': True}
+        elif lrc.get('plain'):
+            print(f"  [fast] ⚠️ LRCLIB plain")
+            result = {'lyrics': parse_plain(lrc['plain']), 'source': 'LRCLib', 'synced': False}
+
+    if not result:
+        yt = fetch_yt_lyrics(video_id)
+        if yt and yt.get('plain'):
+            print(f"  [fast] ✅ YouTube plain!")
+            result = {'lyrics': parse_plain(yt['plain']), 'source': 'YouTube Music', 'synced': False}
+
+    if not result:
+        return None
+
+    result['song'] = title
+    result['artist'] = artist
+
+    if translate_to and result.get('lyrics'):
+        texts = [l['text'] for l in result['lyrics'] if l.get('text')]
+        translations = google_translate_fast(texts, translate_to)
+        for i, lyric in enumerate(result['lyrics']):
+            if i < len(translations) and translations[i]:
+                lyric['translated'] = translations[i]
+
+    return result
 
 def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
     """Try all providers in priority order, return best result."""
@@ -749,16 +834,18 @@ def api_lyrics():
     video_id = request.args.get('v')
     translate_to = request.args.get('lang', 'zh-TW')
     jwt_token = request.args.get('jwt')
+    fast_mode = request.args.get('fast', '0') == '1'
     
     print("=" * 60)
-    print(f"🌟 Lyrics request: {video_id} (lang: {translate_to}, jwt: {'Yes' if jwt_token else 'No'})")
+    mode_str = 'FAST' if fast_mode else ('JWT+Cohere' if jwt_token else 'Normal')
+    print(f"🌟 Lyrics request: {video_id} [{mode_str}]")
     print("=" * 60)
     
     if not video_id:
         return jsonify({"error": "Missing video ID"}), 400
     
-    # Server-side in-flight dedup
-    cache_key = f"{video_id}:{translate_to}"
+    # Separate cache keys for fast vs full results
+    cache_key = f"{video_id}:{translate_to}:fast" if fast_mode else f"{video_id}:{translate_to}"
     if cache_key in _in_flight:
         print(f"⏳ Waiting for in-flight request for {video_id}...")
         _in_flight[cache_key].wait(timeout=30)
@@ -782,6 +869,9 @@ def api_lyrics():
     song_info = get_song_info(video_id)
     
     if not song_info:
+        if cache_key in _in_flight:
+            _in_flight[cache_key].set()
+            del _in_flight[cache_key]
         return jsonify({
             'lyrics': [{'time': 0, 'text': 'Could not identify song', 'translated': '無法識別歌曲', 'duration': 0}],
             'source': 'error', 'synced': False
@@ -789,9 +879,17 @@ def api_lyrics():
     
     print(f"🎵 {song_info['title']} - {song_info['artist']} ({song_info['duration']}s)")
     
-    # Fetch lyrics from all providers
+    # Fetch lyrics
     try:
-        result = fetch_all_lyrics(video_id, song_info, translate_to, jwt_token)
+        if fast_mode:
+            result = fetch_fast_lyrics(video_id, song_info, translate_to)
+            if not result:
+                result = {
+                    'lyrics': [{'time': 0, 'text': 'No lyrics found', 'translated': '找不到歌詞', 'duration': 0}],
+                    'source': 'none', 'synced': False
+                }
+        else:
+            result = fetch_all_lyrics(video_id, song_info, translate_to, jwt_token)
     finally:
         # Always release the in-flight lock
         if cache_key in _in_flight:
