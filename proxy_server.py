@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+import functools
 import json
 import os
 import re
@@ -11,8 +12,20 @@ from datetime import datetime
 from urllib.parse import quote
 
 app = Flask(__name__)
+app.secret_key = 'ytmu-dashboard-secret-key-2026'
 
-# In-memory log buffer for real-time web dashboard
+# Admin password (sha256 of "fs")
+ADMIN_PASSWORD_HASH = hashlib.sha256(b'fs').hexdigest()
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('admin_logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
 _recent_logs = deque(maxlen=500)
 
 class LogTee:
@@ -1053,12 +1066,32 @@ def api_lyrics():
     return jsonify(result)
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        pw = request.form.get('password', '')
+        if hashlib.sha256(pw.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+            session['admin_logged_in'] = True
+            return redirect(url_for('dashboard'))
+        error = 'Wrong password.'
+    return render_template('login.html', error=error)
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
 @app.route('/')
+@login_required
 def dashboard():
     return render_template('index.html')
 
 
 @app.route('/api/admin/logs', methods=['GET'])
+@login_required
 def admin_logs():
     from flask import Response
     text = ''.join(_recent_logs)
@@ -1066,12 +1099,14 @@ def admin_logs():
 
 
 @app.route('/api/admin/logs/clear', methods=['POST'])
+@login_required
 def admin_logs_clear():
     _recent_logs.clear()
     return jsonify({'ok': True})
 
 
 @app.route('/api/admin/caches', methods=['GET'])
+@login_required
 def admin_caches():
     lyrics_dir = 'cache/lyrics'
     items = []
@@ -1116,6 +1151,7 @@ def admin_caches():
 
 
 @app.route('/api/admin/caches/clear_empty', methods=['POST'])
+@login_required
 def admin_clear_empty_caches():
     lyrics_dir = 'cache/lyrics'
     removed = 0
