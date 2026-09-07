@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="mdui-theme-dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YTM Lyrics Server Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/mdui@2/mdui.css">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
+  <script src="https://unpkg.com/mdui@2/mdui.global.js"></script>
+  <style>
+    :root {
+      --mdui-color-primary: 255 64 129;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: rgb(var(--mdui-color-surface));
+      color: rgb(var(--mdui-color-on-surface));
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .main-container {
+      max-width: 1300px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .grid-layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-top: 20px;
+    }
+    @media (max-width: 900px) {
+      .grid-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+    .lyrics-container {
+      height: 520px;
+      overflow-y: auto;
+      background: rgba(var(--mdui-color-surface-container-highest), 0.4);
+      border-radius: 16px;
+      padding: 16px;
+    }
+    .lyric-row {
+      padding: 10px 14px;
+      border-radius: 10px;
+      margin-bottom: 6px;
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+    .lyric-row:hover {
+      background: rgba(var(--mdui-color-primary), 0.15);
+    }
+    .lyric-row.active {
+      background: rgba(var(--mdui-color-primary), 0.25);
+      border-left: 4px solid rgb(var(--mdui-color-primary));
+    }
+    .lyric-row .time-tag {
+      font-size: 11px;
+      opacity: 0.6;
+      font-family: monospace;
+      margin-bottom: 2px;
+    }
+    .lyric-row .orig-text {
+      font-size: 16px;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+    .lyric-row .trans-text {
+      font-size: 14px;
+      opacity: 0.8;
+      color: rgb(var(--mdui-color-secondary));
+      margin-top: 3px;
+    }
+    .log-box {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      background: #0d1117;
+      color: #c9d1d9;
+      border-radius: 12px;
+      padding: 14px;
+      height: 480px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .cache-list-container {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .badge-synced { background: rgba(76, 175, 80, 0.2); color: #81c784; }
+    .badge-plain { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
+    .badge-none { background: rgba(244, 67, 54, 0.2); color: #e57373; }
+  </style>
+</head>
+<body>
+  <mdui-layout>
+    <!-- App Bar -->
+    <mdui-top-app-bar variant="flat">
+      <mdui-button-icon icon="library_music"></mdui-button-icon>
+      <mdui-top-app-bar-title>YTM Lyrics Server Dashboard</mdui-top-app-bar-title>
+      <div style="flex-grow: 1"></div>
+      <mdui-chip icon="bolt" variant="elevated" id="statusChip">Online</mdui-chip>
+      <mdui-button-icon icon="refresh" id="refreshBtn" onclick="reloadAll()"></mdui-button-icon>
+      <mdui-button-icon icon="dark_mode" onclick="toggleTheme()"></mdui-button-icon>
+    </mdui-top-app-bar>
+
+    <mdui-layout-main>
+      <div class="main-container">
+        <!-- Live Search / Preview Header -->
+        <mdui-card variant="filled" style="padding: 16px; border-radius: 16px;">
+          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <mdui-text-field
+              id="videoInput"
+              label="YouTube Video ID or URL"
+              placeholder="e.g. aT8UPGkEVeY, Mm87JgTx2Ao"
+              icon="search"
+              style="flex: 1; min-width: 260px;"
+              clearable>
+            </mdui-text-field>
+            <mdui-segmented-button-group id="modeSelect" value="full">
+              <mdui-segmented-button value="fast">⚡️ Fast (LRCLIB)</mdui-segmented-button>
+              <mdui-segmented-button value="full">🌟 Pro (Cohere + Cubey)</mdui-segmented-button>
+            </mdui-segmented-button-group>
+            <mdui-checkbox id="forceReload">Force Fresh</mdui-checkbox>
+            <mdui-button variant="filled" icon="play_arrow" onclick="fetchLiveLyrics()">Search & Preview</mdui-button>
+          </div>
+        </mdui-card>
+
+        <!-- Main Grid: Live Preview & Caches/Logs -->
+        <div class="grid-layout">
+          <!-- Left: Lyrics Preview & Song Details -->
+          <mdui-card variant="outlined" style="padding: 18px; border-radius: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
+              <div>
+                <h3 style="margin: 0; font-size: 18px;" id="songTitle">Ready to Search</h3>
+                <div style="font-size: 13px; opacity: 0.7; margin-top: 4px;" id="songArtist">Enter video ID above or choose from cached list</div>
+              </div>
+              <div id="sourceBadge"></div>
+            </div>
+
+            <!-- Audio / Playback simulator -->
+            <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
+              <mdui-button-icon icon="play_circle" id="playSimBtn" onclick="togglePlaySim()"></mdui-button-icon>
+              <mdui-slider id="timeSlider" min="0" max="300" value="0" style="flex: 1;" oninput="onSeek(this.value)"></mdui-slider>
+              <span id="timeDisplay" style="font-size: 12px; font-family: monospace; width: 65px; text-align: right;">0:00 / 0:00</span>
+            </div>
+
+            <!-- Lyrics List -->
+            <div class="lyrics-container" id="lyricsList">
+              <div style="text-align: center; padding-top: 120px; opacity: 0.5;">
+                <mdui-icon name="queue_music" style="font-size: 48px; margin-bottom: 8px;"></mdui-icon>
+                <div>No lyrics loaded yet</div>
+              </div>
+            </div>
+          </mdui-card>
+
+          <!-- Right: Caches and Server Logs (Tabs) -->
+          <mdui-card variant="outlined" style="padding: 18px; border-radius: 16px;">
+            <mdui-tabs value="logs" id="rightTabs">
+              <mdui-tab value="logs" icon="terminal">Live Logs</mdui-tab>
+              <mdui-tab value="cache" icon="folder_zip">Cached Songs (<span id="cacheCount">0</span>)</mdui-tab>
+              <mdui-tab value="system" icon="tune">Config & Stats</mdui-tab>
+
+              <mdui-tab-panel slot="panel" value="logs" style="padding-top: 14px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                  <span style="font-size: 12px; opacity: 0.7;">Latest Server Requests & Output</span>
+                  <mdui-button variant="text" icon="clear_all" onclick="clearLogs()">Clear</mdui-button>
+                </div>
+                <div class="log-box" id="logBox">Loading server logs...</div>
+              </mdui-tab-panel>
+
+              <mdui-tab-panel slot="panel" value="cache" style="padding-top: 14px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                  <span style="font-size: 12px; opacity: 0.7;">Saved file caches (`cache/lyrics/*.json`)</span>
+                  <mdui-button variant="tonal" icon="delete_sweep" onclick="clearAllCaches()">Clear Not-Found</mdui-button>
+                </div>
+                <div class="cache-list-container">
+                  <mdui-list id="cacheList">
+                    <mdui-list-item>Loading caches...</mdui-list-item>
+                  </mdui-list>
+                </div>
+              </mdui-tab-panel>
+
+              <mdui-tab-panel slot="panel" value="system" style="padding-top: 14px;">
+                <mdui-list>
+                  <mdui-list-item headline="Provider 0: Cubey API" description="Musixmatch/NetEase/KuGou (Auto Cloudflare Turnstile JWT)"></mdui-list-item>
+                  <mdui-list-item headline="Provider 1: LRCLIB" description="Multi-query cleaned metadata + Synced LRC"></mdui-list-item>
+                  <mdui-list-item headline="Provider 2: Unison Community" description="Synced LRC / TTML / AMLL XML"></mdui-list-item>
+                  <mdui-list-item headline="Provider 3: YouTube Music" description="ytmusicapi fallback"></mdui-list-item>
+                  <mdui-list-item headline="Translation Engine" description="Cohere Command A Translate (Pro) / Google Translate (Fast)"></mdui-list-item>
+                </mdui-list>
+              </mdui-tab-panel>
+            </mdui-tabs>
+          </mdui-card>
+        </div>
+      </div>
+    </mdui-layout-main>
+  </mdui-layout>
+
+  <script>
+    let currentLyrics = [];
+    let playbackInterval = null;
+    let isPlaying = false;
+    let currentSimTime = 0;
+    let songDuration = 0;
+
+    function toggleTheme() {
+      const html = document.documentElement;
+      if (html.classList.contains('mdui-theme-dark')) {
+        html.classList.remove('mdui-theme-dark');
+        html.classList.add('mdui-theme-light');
+      } else {
+        html.classList.remove('mdui-theme-light');
+        html.classList.add('mdui-theme-dark');
+      }
+    }
+
+    function extractVideoId(input) {
+      if (!input) return '';
+      input = input.trim();
+      if (input.includes('youtube.com/watch?v=')) {
+        const url = new URL(input);
+        return url.searchParams.get('v') || input;
+      }
+      if (input.includes('youtu.be/')) {
+        return input.split('youtu.be/')[1].split('?')[0];
+      }
+      if (input.includes('music.youtube.com/watch?v=')) {
+        const url = new URL(input);
+        return url.searchParams.get('v') || input;
+      }
+      return input;
+    }
+
+    function formatTime(seconds) {
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${m}:${s < 10 ? '0' : ''}${s}`;
+    }
+
+    async function fetchLiveLyrics(vid) {
+      const rawInput = vid || document.getElementById('videoInput').value;
+      const videoId = extractVideoId(rawInput);
+      if (!videoId) {
+        mdui.snackbar({ message: 'Please enter a video ID' });
+        return;
+      }
+
+      const mode = document.getElementById('modeSelect').value;
+      const force = document.getElementById('forceReload').checked;
+
+      document.getElementById('songTitle').textContent = `Fetching ${videoId}...`;
+      document.getElementById('songArtist').textContent = 'Querying lyrics providers...';
+      document.getElementById('lyricsList').innerHTML = '<div style="text-align:center; padding-top:100px;"><mdui-circular-progress></mdui-circular-progress></div>';
+
+      try {
+        let url = `/api/lyrics?v=${videoId}&lang=zh-TW`;
+        if (mode === 'fast') url += '&fast=1';
+        if (force) url += '&force=1';
+
+        const res = await fetch(url);
+        const data = await res.json();
+        renderLyrics(data);
+        loadCaches();
+      } catch (err) {
+        mdui.snackbar({ message: 'Request failed: ' + err });
+        document.getElementById('songTitle').textContent = 'Fetch Error';
+        document.getElementById('songArtist').textContent = err.message;
+      }
+    }
+
+    function renderLyrics(data) {
+      const titleEl = document.getElementById('songTitle');
+      const artistEl = document.getElementById('songArtist');
+      const badgeEl = document.getElementById('sourceBadge');
+      const listEl = document.getElementById('lyricsList');
+
+      titleEl.textContent = data.song || 'Unknown Song';
+      artistEl.textContent = data.artist || 'Unknown Artist';
+
+      const isSynced = data.synced;
+      const source = data.source || 'none';
+      badgeEl.innerHTML = `<span class="status-badge ${isSynced ? 'badge-synced' : (source !== 'none' ? 'badge-plain' : 'badge-none')}">
+        <mdui-icon name="${isSynced ? 'check_circle' : 'info'}" style="font-size:14px;"></mdui-icon>
+        ${source} ${isSynced ? '(Synced)' : ''}
+      </span>`;
+
+      currentLyrics = data.lyrics || [];
+      songDuration = currentLyrics.length > 0 ? (currentLyrics[currentLyrics.length - 1].time + 10) : 180;
+      document.getElementById('timeSlider').max = Math.ceil(songDuration);
+
+      if (!currentLyrics || currentLyrics.length === 0) {
+        listEl.innerHTML = '<div style="text-align:center; padding-top:100px; opacity:0.6;">No lyrics lines returned</div>';
+        return;
+      }
+
+      listEl.innerHTML = currentLyrics.map((line, idx) => `
+        <div class="lyric-row" id="lyric-${idx}" onclick="seekToLine(${line.time}, ${idx})">
+          <div class="time-tag">${formatTime(line.time || 0)}</div>
+          <div class="orig-text">${escapeHtml(line.text || '')}</div>
+          ${line.translated ? `<div class="trans-text">${escapeHtml(line.translated)}</div>` : ''}
+        </div>
+      `).join('');
+
+      currentSimTime = 0;
+      updatePlaybackUI();
+    }
+
+    function seekToLine(time, idx) {
+      currentSimTime = time;
+      document.getElementById('timeSlider').value = currentSimTime;
+      highlightActiveLyric(idx);
+      updatePlaybackUI();
+    }
+
+    function onSeek(val) {
+      currentSimTime = parseFloat(val);
+      syncActiveHighlight();
+      updatePlaybackUI();
+    }
+
+    function togglePlaySim() {
+      isPlaying = !isPlaying;
+      const btn = document.getElementById('playSimBtn');
+      if (isPlaying) {
+        btn.icon = 'pause_circle';
+        playbackInterval = setInterval(() => {
+          currentSimTime += 0.5;
+          document.getElementById('timeSlider').value = currentSimTime;
+          syncActiveHighlight();
+          updatePlaybackUI();
+          if (currentSimTime >= songDuration) {
+            togglePlaySim();
+          }
+        }, 500);
+      } else {
+        btn.icon = 'play_circle';
+        clearInterval(playbackInterval);
+      }
+    }
+
+    function syncActiveHighlight() {
+      if (!currentLyrics || currentLyrics.length === 0) return;
+      let activeIdx = -1;
+      for (let i = 0; i < currentLyrics.length; i++) {
+        if (currentSimTime >= currentLyrics[i].time) {
+          activeIdx = i;
+        } else {
+          break;
+        }
+      }
+      highlightActiveLyric(activeIdx);
+    }
+
+    function highlightActiveLyric(idx) {
+      document.querySelectorAll('.lyric-row').forEach((row, i) => {
+        if (i === idx) {
+          row.classList.add('active');
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          row.classList.remove('active');
+        }
+      });
+    }
+
+    function updatePlaybackUI() {
+      document.getElementById('timeDisplay').textContent = `${formatTime(currentSimTime)} / ${formatTime(songDuration)}`;
+    }
+
+    async function loadCaches() {
+      try {
+        const res = await fetch('/api/admin/caches');
+        const list = await res.json();
+        document.getElementById('cacheCount').textContent = list.length;
+        const cacheListEl = document.getElementById('cacheList');
+        if (list.length === 0) {
+          cacheListEl.innerHTML = '<mdui-list-item>No cached songs</mdui-list-item>';
+          return;
+        }
+        cacheListEl.innerHTML = list.map(item => `
+          <mdui-list-item rounded onclick="fetchLiveLyrics('${item.video_id}')" style="cursor:pointer;">
+            <mdui-icon slot="icon" name="${item.synced ? 'music_note' : 'text_snippet'}"></mdui-icon>
+            <div style="font-weight:600;">${escapeHtml(item.song || item.video_id)}</div>
+            <div slot="description" style="font-size:12px; opacity:0.7;">
+              ${escapeHtml(item.artist || 'Unknown')} • ${item.source} (${item.lines} lines) • ${item.time_ago}
+            </div>
+            <mdui-button-icon slot="end-icon" icon="open_in_new"></mdui-button-icon>
+          </mdui-list-item>
+        `).join('');
+      } catch (e) {
+        console.error('Failed to load caches:', e);
+      }
+    }
+
+    async function loadLogs() {
+      try {
+        const res = await fetch('/api/admin/logs');
+        const text = await res.text();
+        const logBox = document.getElementById('logBox');
+        logBox.textContent = text || 'No logs recorded yet.';
+        logBox.scrollTop = logBox.scrollHeight;
+      } catch (e) {
+        console.error('Failed to load logs:', e);
+      }
+    }
+
+    async function clearLogs() {
+      await fetch('/api/admin/logs/clear', { method: 'POST' });
+      document.getElementById('logBox').textContent = '';
+      mdui.snackbar({ message: 'Logs cleared' });
+    }
+
+    async function clearAllCaches() {
+      const res = await fetch('/api/admin/caches/clear_empty', { method: 'POST' });
+      const data = await res.json();
+      mdui.snackbar({ message: `Cleared ${data.cleared} not-found caches` });
+      loadCaches();
+    }
+
+    function reloadAll() {
+      loadCaches();
+      loadLogs();
+      mdui.snackbar({ message: 'Refreshed logs and caches' });
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/[&<>'"]/g, 
+        tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag)
+      );
+    }
+
+    // Auto poll logs and caches
+    setInterval(loadLogs, 3000);
+    loadCaches();
+    loadLogs();
+  </script>
+</body>
+</html>

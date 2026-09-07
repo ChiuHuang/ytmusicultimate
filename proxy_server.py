@@ -1,14 +1,34 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 import json
 import os
 import re
+import sys
 import requests
 import hashlib
 import time as time_module
+from collections import deque
 from datetime import datetime
 from urllib.parse import quote
 
 app = Flask(__name__)
+
+# In-memory log buffer for real-time web dashboard
+_recent_logs = deque(maxlen=500)
+
+class LogTee:
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+
+    def write(self, message):
+        self.original_stream.write(message)
+        if message:
+            _recent_logs.append(message)
+
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = LogTee(sys.stdout)
+sys.stderr = LogTee(sys.stderr)
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -682,8 +702,60 @@ def google_translate_fast(texts, target_lang='zh-TW'):
 
 
 # ============================================================
+# Metadata Cleaning & Variants
+# ============================================================
+
+def get_search_queries(title, artist):
+    """Generate search variations: raw original, cleaned title/artist, and title-only."""
+    queries = []
+    seen = set()
+
+    def add_q(t, a):
+        t_clean = re.sub(r'\s+', ' ', t).strip(' -_./')
+        a_clean = re.sub(r'\s+', ' ', a).strip(' -_./') if a else ''
+        key = (t_clean.lower(), a_clean.lower())
+        if t_clean and key not in seen:
+            seen.add(key)
+            queries.append({'title': t_clean, 'artist': a_clean})
+
+    # 1. Original
+    add_q(title, artist)
+
+    # 2. Filter title and artist
+    # Clean title patterns: (Cover), [Covered by xxx], 【MV】, (Official Video), / Covered by xxx, etc.
+    clean_t = title
+    clean_t = re.sub(r'(?i)[/／]\s*(?:covered\s+by|cover\s+by|cover|歌ってみた).*$', '', clean_t)
+    clean_t = re.sub(r'(?i)[/／]\s*[^/／]+$', '', clean_t)
+    clean_t = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official\s*(?:video|audio|music\s*video|mv|lyric\s*video)?|full\s*ver\.?|cover(?:ed)?(?:\s+by[^\)\]\}】」』）］]*)?|remix|mv|audio|feat\.?[^\)\]\}】」』）］]*|ft\.?[^\)\]\}】」』）］]*|歌ってみた|self\s*cover|[^\)\]\}】」』）］]*ver\.?)\s*[\)\]\}】」』）］]', '', clean_t)
+    clean_t = re.sub(r'(?i)\b(?:feat\.?|ft\.?)\s+.*$', '', clean_t)
+    clean_t = re.sub(r'(?i)\s*-\s*(?:cover|official|remix|mv).*$', '', clean_t)
+
+    # Clean artist patterns: - Topic, Official, etc.
+    clean_a = artist
+    clean_a = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official|topic|channel|vevo)\s*[\)\]\}】」』）］]', '', clean_a)
+    clean_a = re.sub(r'(?i)\s*-\s*topic$', '', clean_a)
+
+    add_q(clean_t, clean_a)
+    add_q(clean_t, '')
+
+    return queries
+
+
+# ============================================================
 # Cache
 # ============================================================
+
+def is_not_found_result(data):
+    """Check if result represents an empty or not found state."""
+    if not data:
+        return True
+    source = data.get('source')
+    lyrics = data.get('lyrics', [])
+    if source in ['none', 'error'] or not lyrics:
+        return True
+    if len(lyrics) == 1 and 'No lyrics found' in lyrics[0].get('text', ''):
+        return True
+    return False
 
 def get_cached(video_id):
     path = f"cache/lyrics/{video_id}.json"
@@ -691,20 +763,46 @@ def get_cached(video_id):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 entry = json.load(f)
+            data = entry.get('data')
+            if is_not_found_result(data):
+                return None
             ts = datetime.fromisoformat(entry['ts'])
             if (datetime.now() - ts).total_seconds() < 86400 * 3:
-                return entry['data']
+                return data
         except:
             pass
     return None
 
 def set_cached(video_id, data):
+    # Do not cache not-found or error records so future attempts or new lyrics can be resolved
+    if is_not_found_result(data):
+        return
     path = f"cache/lyrics/{video_id}.json"
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'data': data, 'ts': datetime.now().isoformat()}, f, ensure_ascii=False)
     except:
         pass
+
+def clear_not_found_caches():
+    lyrics_dir = 'cache/lyrics'
+    if not os.path.exists(lyrics_dir):
+        return
+    removed = 0
+    for fname in os.listdir(lyrics_dir):
+        if fname.endswith('.json'):
+            fpath = os.path.join(lyrics_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    entry = json.load(f)
+                if is_not_found_result(entry.get('data')):
+                    os.remove(fpath)
+                    removed += 1
+            except Exception:
+                pass
+    if removed > 0:
+        print(f"🧹 Cleaned {removed} empty/not-found cache files at startup.")
 
 
 # ============================================================
@@ -717,22 +815,26 @@ import threading
 
 def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
     """Fast path: LRCLIB only + Google translate. Returns in ~1-2s."""
-    title = song_info['title']
-    artist = song_info['artist']
     album = song_info.get('album', '')
     duration = song_info.get('duration', 0)
     result = None
 
-    lrc = fetch_lrclib(title, artist, album, duration)
-    if lrc:
-        if lrc.get('instrumental'):
-            result = {'lyrics': [{'time': 0, 'text': '🎵 Instrumental', 'translated': '純音樂', 'duration': 0}], 'source': 'LRCLib', 'synced': False}
-        elif lrc.get('synced'):
-            print(f"  [fast] ✅ LRCLIB synced!")
-            result = {'lyrics': parse_lrc(lrc['synced'], duration), 'source': 'LRCLib', 'synced': True}
-        elif lrc.get('plain'):
-            print(f"  [fast] ⚠️ LRCLIB plain")
-            result = {'lyrics': parse_plain(lrc['plain']), 'source': 'LRCLib', 'synced': False}
+    queries = get_search_queries(song_info['title'], song_info['artist'])
+    for q in queries:
+        q_title = q['title']
+        q_artist = q['artist']
+        lrc = fetch_lrclib(q_title, q_artist, album, duration)
+        if lrc:
+            if lrc.get('instrumental'):
+                result = {'lyrics': [{'time': 0, 'text': '🎵 Instrumental', 'translated': '純音樂', 'duration': 0}], 'source': 'LRCLib', 'synced': False}
+                break
+            elif lrc.get('synced'):
+                print(f"  [fast] ✅ LRCLIB synced! (query: {q_title} - {q_artist})")
+                result = {'lyrics': parse_lrc(lrc['synced'], duration), 'source': 'LRCLib', 'synced': True}
+                break
+            elif lrc.get('plain') and not result:
+                print(f"  [fast] ⚠️ LRCLIB plain (query: {q_title} - {q_artist})")
+                result = {'lyrics': parse_plain(lrc['plain']), 'source': 'LRCLib', 'synced': False}
 
     if not result:
         yt = fetch_yt_lyrics(video_id)
@@ -743,8 +845,8 @@ def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
     if not result:
         return None
 
-    result['song'] = title
-    result['artist'] = artist
+    result['song'] = song_info['title']
+    result['artist'] = song_info['artist']
 
     if translate_to and result.get('lyrics'):
         texts = [l['text'] for l in result['lyrics'] if l.get('text')]
@@ -762,65 +864,75 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
     artist = song_info['artist']
     album = song_info.get('album', '')
     duration = song_info.get('duration', 0)
+    queries = get_search_queries(title, artist)
     
     result = None
     
     # Priority 0: Cubey API (if we have JWT)
     if jwt_token:
         print(f"  [0/4] Trying Cubey API (with JWT)...")
-        cubey = fetch_cubey(jwt_token, video_id, title, artist, duration)
-        if cubey and cubey.get('synced'):
-            print(f"  ✅ Cubey: synced LRC lyrics found from {cubey.get('source')}!")
-            parsed = parse_lrc(cubey['synced'], duration)
-            result = {'lyrics': parsed, 'source': cubey.get('source'), 'synced': True}
-            # Skip other providers - we already have the best
-            result['song'] = title
-            result['artist'] = artist
-            if translate_to and result.get('lyrics'):
-                print(f"  🌐 Translating {len(result['lyrics'])} lines with Cohere...")
-                texts = [l['text'] for l in result['lyrics'] if l.get('text')]
-                translations = cohere_translate(texts, translate_to)
-                for i, lyric in enumerate(result['lyrics']):
-                    if i < len(translations):
-                        lyric['translated'] = translations[i]
-            return result
+        for q in queries:
+            q_title = q['title']
+            q_artist = q['artist']
+            cubey = fetch_cubey(jwt_token, video_id, q_title, q_artist, duration)
+            if cubey and cubey.get('synced'):
+                print(f"  ✅ Cubey: synced LRC lyrics found from {cubey.get('source')}! (query: {q_title} - {q_artist})")
+                parsed = parse_lrc(cubey['synced'], duration)
+                result = {'lyrics': parsed, 'source': cubey.get('source'), 'synced': True}
+                # Skip other providers - we already have the best
+                result['song'] = title
+                result['artist'] = artist
+                if translate_to and result.get('lyrics'):
+                    print(f"  🌐 Translating {len(result['lyrics'])} lines with Cohere...")
+                    texts = [l['text'] for l in result['lyrics'] if l.get('text')]
+                    translations = cohere_translate(texts, translate_to)
+                    for i, lyric in enumerate(result['lyrics']):
+                        if i < len(translations):
+                            lyric['translated'] = translations[i]
+                return result
     
     # Priority 1: LRCLIB (best for synced lyrics)
     print(f"  [1/3] Trying LRCLIB...")
-    lrc = fetch_lrclib(title, artist, album, duration)
-    if lrc:
-        if lrc.get('instrumental'):
-            result = {
-                'lyrics': [{'time': 0, 'text': '🎵 Instrumental', 'translated': '純音樂', 'duration': 0}],
-                'source': 'LRCLib', 'synced': False
-            }
-        elif lrc.get('synced'):
-            print(f"  ✅ LRCLIB: synced lyrics found!")
-            parsed = parse_lrc(lrc['synced'], duration)
-            result = {'lyrics': parsed, 'source': 'LRCLib', 'synced': True}
-        elif lrc.get('plain'):
-            print(f"  ⚠️ LRCLIB: plain lyrics only")
-            parsed = parse_plain(lrc['plain'])
-            result = {'lyrics': parsed, 'source': 'LRCLib', 'synced': False}
+    for q in queries:
+        q_title = q['title']
+        q_artist = q['artist']
+        lrc = fetch_lrclib(q_title, q_artist, album, duration)
+        if lrc:
+            if lrc.get('instrumental'):
+                result = {
+                    'lyrics': [{'time': 0, 'text': '🎵 Instrumental', 'translated': '純音樂', 'duration': 0}],
+                    'source': 'LRCLib', 'synced': False
+                }
+                break
+            elif lrc.get('synced'):
+                print(f"  ✅ LRCLIB: synced lyrics found! (query: {q_title} - {q_artist})")
+                parsed = parse_lrc(lrc['synced'], duration)
+                result = {'lyrics': parsed, 'source': 'LRCLib', 'synced': True}
+                break
+            elif lrc.get('plain') and not result:
+                print(f"  ⚠️ LRCLIB: plain lyrics only (query: {q_title} - {q_artist})")
+                parsed = parse_plain(lrc['plain'])
+                result = {'lyrics': parsed, 'source': 'LRCLib', 'synced': False}
     
     # Priority 2: Unison (community)
     if not result or not result.get('synced'):
         print(f"  [2/3] Trying Unison...")
-        uni = fetch_unison(video_id, title, artist, duration)
-        if uni:
-            if uni.get('parsed'):
-                # Already parsed TTML
-                print(f"  ✅ Unison: TTML lyrics found!")
-                if not result or not result.get('synced'):
-                    result = {'lyrics': uni['parsed'], 'source': 'Unison', 'synced': True}
-            elif uni.get('synced'):
-                print(f"  ✅ Unison: synced LRC lyrics found!")
-                parsed = parse_lrc(uni['synced'], duration)
-                if not result or not result.get('synced'):
-                    result = {'lyrics': parsed, 'source': 'Unison', 'synced': True}
-            elif uni.get('plain'):
-                print(f"  ⚠️ Unison: plain lyrics only")
-                if not result:
+        for q in queries:
+            uni = fetch_unison(video_id, q['title'], q['artist'], duration)
+            if uni:
+                if uni.get('parsed'):
+                    print(f"  ✅ Unison: TTML lyrics found! (query: {q['title']})")
+                    if not result or not result.get('synced'):
+                        result = {'lyrics': uni['parsed'], 'source': 'Unison', 'synced': True}
+                        break
+                elif uni.get('synced'):
+                    print(f"  ✅ Unison: synced LRC lyrics found! (query: {q['title']})")
+                    parsed = parse_lrc(uni['synced'], duration)
+                    if not result or not result.get('synced'):
+                        result = {'lyrics': parsed, 'source': 'Unison', 'synced': True}
+                        break
+                elif uni.get('plain') and not result:
+                    print(f"  ⚠️ Unison: plain lyrics only (query: {q['title']})")
                     parsed = parse_plain(uni['plain'])
                     result = {'lyrics': parsed, 'source': 'Unison', 'synced': False}
     
@@ -932,13 +1044,94 @@ def api_lyrics():
             _in_flight[cache_key].set()
             del _in_flight[cache_key]
     
-    # Cache result
+    # Cache result (only if real lyrics were found)
     set_cached(cache_key, result)
     
     print(f"📤 Returning {len(result.get('lyrics', []))} lines from {result.get('source', '?')}")
     print("=" * 60)
     
     return jsonify(result)
+
+
+@app.route('/')
+def dashboard():
+    return render_template('index.html')
+
+
+@app.route('/api/admin/logs', methods=['GET'])
+def admin_logs():
+    from flask import Response
+    text = ''.join(_recent_logs)
+    return Response(text, mimetype='text/plain')
+
+
+@app.route('/api/admin/logs/clear', methods=['POST'])
+def admin_logs_clear():
+    _recent_logs.clear()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/caches', methods=['GET'])
+def admin_caches():
+    lyrics_dir = 'cache/lyrics'
+    items = []
+    if os.path.exists(lyrics_dir):
+        for fname in sorted(os.listdir(lyrics_dir),
+                            key=lambda f: os.path.getmtime(os.path.join(lyrics_dir, f)),
+                            reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            fpath = os.path.join(lyrics_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    entry = json.load(f)
+                data = entry.get('data', {})
+                ts_str = entry.get('ts', '')
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                    diff = (datetime.now() - ts).total_seconds()
+                    if diff < 3600:
+                        time_ago = f"{int(diff // 60)}m ago"
+                    elif diff < 86400:
+                        time_ago = f"{int(diff // 3600)}h ago"
+                    else:
+                        time_ago = f"{int(diff // 86400)}d ago"
+                except Exception:
+                    time_ago = 'unknown'
+                cache_key = fname[:-5]
+                video_id = cache_key.split(':')[0]
+                items.append({
+                    'video_id': video_id,
+                    'cache_key': cache_key,
+                    'song': data.get('song', ''),
+                    'artist': data.get('artist', ''),
+                    'source': data.get('source', '?'),
+                    'synced': data.get('synced', False),
+                    'lines': len(data.get('lyrics', [])),
+                    'time_ago': time_ago,
+                })
+            except Exception:
+                pass
+    return jsonify(items)
+
+
+@app.route('/api/admin/caches/clear_empty', methods=['POST'])
+def admin_clear_empty_caches():
+    lyrics_dir = 'cache/lyrics'
+    removed = 0
+    if os.path.exists(lyrics_dir):
+        for fname in os.listdir(lyrics_dir):
+            if fname.endswith('.json'):
+                fpath = os.path.join(lyrics_dir, fname)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        entry = json.load(f)
+                    if is_not_found_result(entry.get('data')):
+                        os.remove(fpath)
+                        removed += 1
+                except Exception:
+                    pass
+    return jsonify({'cleared': removed})
 
 
 @app.route('/log', methods=['POST'])
@@ -977,4 +1170,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print("Server: http://0.0.0.0:20016")
     print("=" * 60)
+    
+    clear_not_found_caches()
     app.run(host='0.0.0.0', port=20016, debug=True)
+
