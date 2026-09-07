@@ -114,9 +114,7 @@
       <mdui-chip icon="bolt" variant="elevated" id="statusChip">Online</mdui-chip>
       <mdui-button-icon icon="refresh" id="refreshBtn" onclick="reloadAll()"></mdui-button-icon>
       <mdui-button-icon icon="dark_mode" onclick="toggleTheme()"></mdui-button-icon>
-      <form method="POST" action="/logout" style="display:inline;">
-        <mdui-button-icon icon="logout" type="submit" title="Logout"></mdui-button-icon>
-      </form>
+      <mdui-button-icon icon="logout" title="Sign out" onclick="fetch('/logout',{method:'POST'}).then(()=>location.href='/login')"></mdui-button-icon>
     </mdui-top-app-bar>
 
     <mdui-layout-main>

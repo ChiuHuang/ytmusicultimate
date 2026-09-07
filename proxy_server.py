@@ -12,10 +12,30 @@ from datetime import datetime
 from urllib.parse import quote
 
 app = Flask(__name__)
-app.secret_key = 'ytmu-dashboard-secret-key-2026'
 
-# Admin password (sha256 of "fs")
-ADMIN_PASSWORD_HASH = hashlib.sha256(b'fs').hexdigest()
+# ============================================================
+# Admin config -- persisted to config/admin_config.json
+# ============================================================
+import secrets as _secrets
+
+_ADMIN_CONFIG_FILE = os.path.join('config', 'admin_config.json')
+
+def _load_admin_config():
+    if os.path.exists(_ADMIN_CONFIG_FILE):
+        with open(_ADMIN_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    cfg = {'secret_key': _secrets.token_hex(32), 'password_hash': None}
+    _save_admin_config(cfg)
+    return cfg
+
+def _save_admin_config(cfg):
+    os.makedirs('config', exist_ok=True)
+    with open(_ADMIN_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
+
+_admin_cfg = _load_admin_config()
+app.secret_key = _admin_cfg['secret_key']
+
 
 def login_required(f):
     @functools.wraps(f)
@@ -1068,20 +1088,43 @@ def api_lyrics():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if not _admin_cfg.get('password_hash'):
+        return redirect(url_for('setup'))
     error = None
     if request.method == 'POST':
         pw = request.form.get('password', '')
-        if hashlib.sha256(pw.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+        if hashlib.sha256(pw.encode()).hexdigest() == _admin_cfg['password_hash']:
             session['admin_logged_in'] = True
             return redirect(url_for('dashboard'))
         error = 'Wrong password.'
     return render_template('login.html', error=error)
 
 
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    # Only accessible when no password is configured yet
+    if _admin_cfg.get('password_hash'):
+        return redirect(url_for('login'))
+    error = None
+    if request.method == 'POST':
+        pw = request.form.get('password', '').strip()
+        pw2 = request.form.get('password2', '').strip()
+        if not pw:
+            error = 'Password cannot be empty.'
+        elif pw != pw2:
+            error = 'Passwords do not match.'
+        else:
+            _admin_cfg['password_hash'] = hashlib.sha256(pw.encode()).hexdigest()
+            _save_admin_config(_admin_cfg)
+            session['admin_logged_in'] = True
+            return redirect(url_for('dashboard'))
+    return render_template('setup.html', error=error)
+
+
 @app.route('/logout', methods=['POST'])
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return jsonify({'ok': True})
 
 
 @app.route('/')
