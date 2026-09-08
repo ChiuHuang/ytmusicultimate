@@ -1,10 +1,13 @@
 name: Build and Release YTMusicUltimate
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs: 
+    inputs:
       ipa_url:
         description: "URL to the decrypted IPA file"
-        default: ""
+        default: "https://file.chiuhuang.dev/dl/8d2a6b4f-8af4-4b1e-9f5e-e2524f5b06ab"
         required: true
         type: string
 
@@ -19,6 +22,11 @@ on:
         default: "com.google.ios.youtubemusic"
         required: true
         type: string
+
+env:
+  IPA_URL: ${{ inputs.ipa_url || 'https://file.chiuhuang.dev/dl/8d2a6b4f-8af4-4b1e-9f5e-e2524f5b06ab' }}
+  DISPLAY_NAME: ${{ inputs.display_name || 'YouTube Music' }}
+  BUNDLE_ID: ${{ inputs.bundle_id || 'com.google.ios.youtubemusic' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -38,14 +46,9 @@ jobs:
           path: main
           submodules: recursive
 
-      - name: Hide sensitive inputs
-        uses: levibostian/action-hide-sensitive-inputs@v1
-        with:
-          exclude_inputs: bundle_id,display_name
-
       - name: Validate IPA URL
         run: |
-          curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}" > /dev/null 2>&1
+          curl -L -r 0-1023 -o sample.part "${{ env.IPA_URL }}" > /dev/null 2>&1
           
           file_type=$(file --mime-type -b sample.part)
 
@@ -94,7 +97,7 @@ jobs:
         run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
       - name: Download YouTube Music
-        run: wget "${{ inputs.ipa_url }}" --no-verbose -O ytm.ipa
+        run: wget "${{ env.IPA_URL }}" --no-verbose -O ytm.ipa
 
       - name: Build Tweak for Sideloading
         run: |
@@ -103,14 +106,15 @@ jobs:
           mv packages/*.deb ../ytmult.deb
 
       - name: Inject tweak into provided IPA
-        run: cyan -i ytm.ipa -o YTMusicUltimate.ipa -uwsf ytmult.deb -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }} 
+        run: cyan -i ytm.ipa -o YTMusicUltimate.ipa -uwsf ytmult.deb -n "${{ env.DISPLAY_NAME }}" -b ${{ env.BUNDLE_ID }}
 
       - name: Create Release
         uses: softprops/action-gh-release@v2.5.0
         with:
-          name: YTMusicUltimate (${{ github.run_number }})
+          tag_name: build-${{ github.run_number }}
+          name: YTMusicUltimate (build ${{ github.run_number }})
           files: YTMusicUltimate.ipa
-          draft: true
+          draft: false
 
       - name: Output Release URL
         run: |
