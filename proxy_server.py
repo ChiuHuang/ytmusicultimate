@@ -46,6 +46,9 @@ def login_required(f):
     return decorated
 
 
+import logging
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
 _recent_logs = deque(maxlen=500)
 _structured_logs = deque(maxlen=300)
 
@@ -53,6 +56,11 @@ def _classify_log(msg):
     """Classify a log message into (level, icon) based on content."""
     stripped = msg.strip()
     if not stripped:
+        return None, None
+    # Filter out HTTP polling noise / Werkzeug access logs
+    if 'HTTP/1.' in stripped or 'GET /api/admin/' in stripped or 'POST /api/admin/' in stripped:
+        return None, None
+    if re.search(r'\d+\.\d+\.\d+\.\d+ - - \[.*\] ".*" \d+', stripped):
         return None, None
     if stripped.startswith(('Error', 'error', 'Traceback')):
         return 'error', 'error'
@@ -68,11 +76,13 @@ def _classify_log(msg):
         '\U0001f9f9': ('info', 'delete_sweep'),
         '\U0001f4e6': ('info', 'upload_file'),
         '\U0001f3b5': ('info', 'music_note'),
+        '\U0001f4f1': ('device', 'phone_iphone'),
     }
     for emoji, (level, icon) in emoji_map.items():
         if emoji in stripped:
             return level, icon
     kw_map = [
+        ('[iOS Tweak]', 'device', 'phone_iphone'),
         ('Cache hit', 'success', 'cached'),
         ('Got result from in-flight', 'success', 'cached'),
         ('Returning', 'response', 'upload'),
@@ -104,8 +114,10 @@ class LogTee:
     def write(self, message):
         self.original_stream.write(message)
         if message:
-            _recent_logs.append(message)
             stripped = message.strip()
+            if 'HTTP/1.' in stripped or 'GET /api/admin/' in stripped or 'POST /api/admin/' in stripped:
+                return
+            _recent_logs.append(message)
             if stripped and stripped != '=' * 60:
                 level, icon = _classify_log(stripped)
                 if level:
@@ -1064,6 +1076,14 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
 @app.route('/api/lyrics', methods=['GET'])
 def api_lyrics():
     video_id = request.args.get('v')
+    if not video_id:
+        return jsonify({"error": "Missing video ID"}), 400
+
+    if video_id.startswith('DEBUG_'):
+        debug_msg = video_id[6:]
+        print(f"📱 [iOS Tweak] {debug_msg}")
+        return jsonify({"ok": True, "source": "debug"})
+
     translate_to = request.args.get('lang', 'zh-TW')
     jwt_token = request.args.get('jwt')
     fast_mode = request.args.get('fast', '0') == '1'
@@ -1074,9 +1094,6 @@ def api_lyrics():
     if force_mode: mode_str += ' [FORCE]'
     print(f"🌟 Lyrics request: {video_id} [{mode_str}]")
     print("=" * 60)
-    
-    if not video_id:
-        return jsonify({"error": "Missing video ID"}), 400
     
     # Separate cache keys for fast vs full results
     cache_key = f"{video_id}:{translate_to}:fast" if fast_mode else f"{video_id}:{translate_to}"

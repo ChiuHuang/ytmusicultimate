@@ -18,6 +18,11 @@
 - (BOOL)isDisabled;
 @end
 
+@interface YTMNowPlayingViewController (YTMULyrics)
+- (void)ytmu_makeLyricsViewClickable:(UIView *)v;
+- (void)ytmu_didTapLyricsBar:(UITapGestureRecognizer *)gesture;
+@end
+
 @interface YTPlayerViewController (YTMUExt)
 - (double)currentMediaTime;
 - (void)seekToTime:(double)time toleranceBefore:(double)before toleranceAfter:(double)after;
