@@ -1,9 +1,26 @@
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #import "YTMUTurnstileManager.h"
+#import "Headers/YTPlayerViewController.h"
+#import "Headers/YTIButtonRenderer.h"
+#import "Headers/YTMNowPlayingViewController.h"
+#import "Headers/ELMNodeController.h"
 
-@interface YTPlayerViewController : UIViewController
-@property (readonly, nonatomic) NSString *currentVideoID;
+@interface UIView ()
+- (UIViewController *)_viewControllerForAncestor;
+@end
+
+@interface ELMTouchCommandPropertiesHandler : NSObject
+- (void)handleTap;
+@end
+
+@interface YTIButtonRenderer ()
+- (BOOL)isDisabled;
+@end
+
+@interface YTPlayerViewController (YTMUExt)
 - (double)currentMediaTime;
+- (void)seekToTime:(double)time toleranceBefore:(double)before toleranceAfter:(double)after;
 @end
 
 // Global current time updated by player hook
@@ -772,7 +789,7 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
             if (key && [key containsString:@"lyric"]) {
                 if (class_getInstanceVariable([self class], "_tapRecognizer") != NULL) {
                     UIGestureRecognizer *tapRecognizer = [self valueForKey:@"_tapRecognizer"];
-                    UIViewController *vc = [tapRecognizer.view performSelector:@selector(_viewControllerForAncestor)];
+                    UIViewController *vc = [tapRecognizer.view _viewControllerForAncestor];
                     openLyricsFromViewController(vc);
                     return;
                 }
@@ -817,15 +834,10 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 
 %new
 - (void)ytmu_didTapLyricsBar:(UITapGestureRecognizer *)gesture {
-    openLyricsFromViewController(self);
+    openLyricsFromViewController((UIViewController *)self);
 }
 
 %end
-
-@interface YTPlayerViewController (YTMU)
-- (void)seekToTime:(double)time;
-- (void)seekToTime:(double)time toleranceBefore:(double)before toleranceAfter:(double)after;
-@end
 
 %hook YTPlayerViewController
 
