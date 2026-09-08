@@ -47,6 +47,55 @@ def login_required(f):
 
 
 _recent_logs = deque(maxlen=500)
+_structured_logs = deque(maxlen=300)
+
+def _classify_log(msg):
+    """Classify a log message into (level, icon) based on content."""
+    stripped = msg.strip()
+    if not stripped:
+        return None, None
+    if stripped.startswith(('Error', 'error', 'Traceback')):
+        return 'error', 'error'
+    emoji_map = {
+        '\u2705': ('success', 'check_circle'),
+        '\u274c': ('error', 'cancel'),
+        '\u26a0': ('warning', 'warning'),
+        '\u23f3': ('pending', 'hourglass_empty'),
+        '\U0001f50d': ('info', 'person_search'),
+        '\U0001f310': ('translate', 'translate'),
+        '\U0001f4e4': ('response', 'upload'),
+        '\U0001f31f': ('request', 'search'),
+        '\U0001f9f9': ('info', 'delete_sweep'),
+        '\U0001f4e6': ('info', 'upload_file'),
+        '\U0001f3b5': ('info', 'music_note'),
+    }
+    for emoji, (level, icon) in emoji_map.items():
+        if emoji in stripped:
+            return level, icon
+    kw_map = [
+        ('Cache hit', 'success', 'cached'),
+        ('Got result from in-flight', 'success', 'cached'),
+        ('Returning', 'response', 'upload'),
+        ('Waiting for in-flight', 'pending', 'hourglass_empty'),
+        ('Looking up', 'info', 'person_search'),
+        ('Trying Cubey', 'info', 'cloud'),
+        ('Trying LRCLIB', 'info', 'cloud'),
+        ('Trying Unison', 'info', 'cloud'),
+        ('Trying YouTube', 'info', 'cloud'),
+        ('Translating', 'translate', 'translate'),
+        ('Cohere', 'translate', 'translate'),
+        ('Cleaned', 'info', 'delete_sweep'),
+        ('Saved to', 'success', 'save'),
+        ('Rate limited', 'warning', 'speed'),
+        ('All keys failed', 'error', 'vpn_key_off'),
+    ]
+    for keyword, level, icon in kw_map:
+        if keyword in stripped:
+            return level, icon
+    if stripped.startswith('  '):
+        return 'detail', 'subdirectory_arrow_right'
+    return 'info', 'info'
+
 
 class LogTee:
     def __init__(self, original_stream):
@@ -56,6 +105,16 @@ class LogTee:
         self.original_stream.write(message)
         if message:
             _recent_logs.append(message)
+            stripped = message.strip()
+            if stripped and stripped != '=' * 60:
+                level, icon = _classify_log(stripped)
+                if level:
+                    _structured_logs.append({
+                        'ts': datetime.now().strftime('%H:%M:%S'),
+                        'level': level,
+                        'icon': icon or 'info',
+                        'msg': stripped,
+                    })
 
     def flush(self):
         self.original_stream.flush()
@@ -1131,15 +1190,18 @@ def dashboard():
 @app.route('/api/admin/logs', methods=['GET'])
 @login_required
 def admin_logs():
-    from flask import Response
-    text = ''.join(_recent_logs)
-    return Response(text, mimetype='text/plain')
+    after_idx = request.args.get('after', type=int, default=-1)
+    logs_list = list(_structured_logs)
+    if after_idx >= 0 and after_idx < len(logs_list):
+        logs_list = logs_list[after_idx + 1:]
+    return jsonify({'logs': logs_list, 'total': len(_structured_logs)})
 
 
 @app.route('/api/admin/logs/clear', methods=['POST'])
 @login_required
 def admin_logs_clear():
     _recent_logs.clear()
+    _structured_logs.clear()
     return jsonify({'ok': True})
 
 

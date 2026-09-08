@@ -85,18 +85,79 @@
       margin-top: 3px;
     }
     .log-box {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12px;
-      line-height: 1.45;
       background: #0d1117;
-      color: #c9d1d9;
       border-radius: 12px;
-      padding: 14px;
+      padding: 8px;
       height: 480px;
       overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
     }
+    .log-box:empty::after {
+      content: 'No log entries yet';
+      display: block;
+      text-align: center;
+      padding: 120px 0;
+      opacity: 0.4;
+      font-size: 14px;
+      color: #c9d1d9;
+    }
+    .log-entry {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+      animation: logFadeIn 0.25s ease;
+      transition: background 0.15s;
+    }
+    .log-entry:hover {
+      background: rgba(255,255,255,0.04);
+    }
+    .log-entry + .log-entry {
+      border-top: 1px solid rgba(255,255,255,0.04);
+    }
+    @keyframes logFadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .log-entry .log-ts {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11px;
+      color: #6e7681;
+      min-width: 56px;
+      flex-shrink: 0;
+      padding-top: 1px;
+    }
+    .log-entry .log-icon {
+      font-size: 16px;
+      flex-shrink: 0;
+      width: 20px;
+      text-align: center;
+    }
+    .log-entry .log-msg {
+      color: #c9d1d9;
+      word-break: break-word;
+      flex: 1;
+    }
+    /* Level colors */
+    .log-entry[data-level="success"] .log-icon { color: #3fb950; }
+    .log-entry[data-level="success"] .log-msg  { color: #aff5b4; }
+    .log-entry[data-level="error"] .log-icon   { color: #f85149; }
+    .log-entry[data-level="error"] .log-msg    { color: #ffa198; }
+    .log-entry[data-level="warning"] .log-icon { color: #d29922; }
+    .log-entry[data-level="warning"] .log-msg  { color: #e3b341; }
+    .log-entry[data-level="request"] .log-icon { color: #a371f7; }
+    .log-entry[data-level="request"] .log-msg  { color: #d2a8ff; font-weight: 600; }
+    .log-entry[data-level="response"] .log-icon{ color: #79c0ff; }
+    .log-entry[data-level="response"] .log-msg { color: #a5d6ff; }
+    .log-entry[data-level="translate"] .log-icon{ color: #56d4dd; }
+    .log-entry[data-level="translate"] .log-msg { color: #7ee8ea; }
+    .log-entry[data-level="pending"] .log-icon { color: #d29922; }
+    .log-entry[data-level="pending"] .log-msg  { color: #e3b341; font-style: italic; }
+    .log-entry[data-level="detail"] .log-icon  { color: #484f58; }
+    .log-entry[data-level="detail"] .log-msg   { color: #8b949e; font-size: 12px; }
+    .log-entry[data-level="info"] .log-icon    { color: #8b949e; }
     .cache-list-container {
       max-height: 400px;
       overflow-y: auto;
@@ -187,10 +248,13 @@
 
               <mdui-tab-panel slot="panel" value="logs" style="padding-top: 14px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                  <span style="font-size: 12px; opacity: 0.7;">Latest Server Requests & Output</span>
-                  <mdui-button variant="text" icon="clear_all" onclick="clearLogs()">Clear</mdui-button>
+                  <span style="font-size: 12px; opacity: 0.7;">Real-time Server Activity <mdui-badge id="logCountBadge" style="margin-left: 6px;">0</mdui-badge></span>
+                  <div style="display: flex; gap: 4px; align-items: center;">
+                    <mdui-checkbox id="logAutoScroll" checked>Auto-scroll</mdui-checkbox>
+                    <mdui-button variant="text" icon="clear_all" onclick="clearLogs()">Clear</mdui-button>
+                  </div>
                 </div>
-                <div class="log-box" id="logBox">Loading server logs...</div>
+                <div class="log-box" id="logBox"></div>
               </mdui-tab-panel>
 
               <mdui-tab-panel slot="panel" value="cache" style="padding-top: 14px;">
@@ -441,13 +505,51 @@
       }
     }
 
+    let _logTotal = 0;
+
+    function renderLogEntry(entry) {
+      const div = document.createElement('div');
+      div.className = 'log-entry';
+      div.setAttribute('data-level', entry.level || 'info');
+      div.innerHTML = `<span class="log-ts">${escapeHtml(entry.ts)}</span>`
+        + `<span class="log-icon material-icons">${escapeHtml(entry.icon || 'info')}</span>`
+        + `<span class="log-msg">${escapeHtml(entry.msg)}</span>`;
+      return div;
+    }
+
     async function loadLogs() {
       try {
         const res = await fetch('/api/admin/logs');
-        const text = await res.text();
+        const data = await res.json();
         const logBox = document.getElementById('logBox');
-        logBox.textContent = text || 'No logs recorded yet.';
-        logBox.scrollTop = logBox.scrollHeight;
+        const entries = data.logs || [];
+        const total = data.total || 0;
+
+        if (_logTotal === 0 || total < _logTotal) {
+          // First load or server was cleared: full render
+          logBox.innerHTML = '';
+          entries.forEach(e => logBox.appendChild(renderLogEntry(e)));
+        } else if (total > _logTotal) {
+          // Incremental: only append new entries
+          const newCount = total - _logTotal;
+          const newEntries = entries.slice(-newCount);
+          newEntries.forEach(e => logBox.appendChild(renderLogEntry(e)));
+          // Cap DOM nodes to 300
+          while (logBox.children.length > 300) {
+            logBox.removeChild(logBox.firstChild);
+          }
+        }
+        _logTotal = total;
+
+        // Update badge
+        const badge = document.getElementById('logCountBadge');
+        if (badge) badge.textContent = total;
+
+        // Auto-scroll
+        const autoScroll = document.getElementById('logAutoScroll');
+        if (!autoScroll || autoScroll.checked) {
+          logBox.scrollTop = logBox.scrollHeight;
+        }
       } catch (e) {
         console.error('Failed to load logs:', e);
       }
@@ -455,7 +557,10 @@
 
     async function clearLogs() {
       await fetch('/api/admin/logs/clear', { method: 'POST' });
-      document.getElementById('logBox').textContent = '';
+      document.getElementById('logBox').innerHTML = '';
+      _logTotal = 0;
+      const badge = document.getElementById('logCountBadge');
+      if (badge) badge.textContent = '0';
       mdui.snackbar({ message: 'Logs cleared' });
     }
 
@@ -467,6 +572,7 @@
     }
 
     function reloadAll() {
+      _logTotal = 0;
       loadCaches();
       loadLogs();
       mdui.snackbar({ message: 'Refreshed logs and caches' });
@@ -478,8 +584,9 @@
       );
     }
 
-    // Auto poll logs and caches
-    setInterval(loadLogs, 3000);
+    // Auto poll logs (2s) and caches (10s)
+    setInterval(loadLogs, 2000);
+    setInterval(loadCaches, 10000);
     loadCaches();
     loadLogs();
   </script>
