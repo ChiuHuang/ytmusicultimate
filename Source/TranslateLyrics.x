@@ -323,6 +323,7 @@ static void sendUIDump(void) {
 @property (nonatomic, strong) UIVisualEffectView *blurView;
 @property (nonatomic, strong) UIView *darkOverlay;
 @property (nonatomic, assign) BOOL isModal;
+@property (nonatomic, assign) BOOL isSynced;
 - (void)updateLyrics:(NSArray *)newLyrics;
 - (void)fetchLyricsForVideo:(NSString *)videoID;
 - (void)loadArtworkForVideo:(NSString *)videoID;
@@ -631,7 +632,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 }
 
 - (void)updatePlaybackTime {
-    if (self.lyrics.count == 0) return;
+    if (!self.isSynced || self.lyrics.count == 0) return;
 
     double currentTime = 0;
     if (g_activePlayer) {
@@ -764,6 +765,19 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
 - (void)updateLyrics:(NSArray *)newLyrics {
     self.lyrics = newLyrics;
+
+    BOOL hasTimestamp = NO;
+    for (NSDictionary *l in newLyrics) {
+        if ([l[@"time"] doubleValue] > 0.0) {
+            hasTimestamp = YES;
+            break;
+        }
+    }
+    self.isSynced = hasTimestamp;
+    if (!self.isSynced) {
+        self.currentIndex = -1;
+    }
+
     [self.tableView reloadData];
 
     if (newLyrics.count > 0) {
@@ -887,7 +901,19 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     NSArray *parts = lyric[@"parts"];
     NSString *displayText = [self normalizedLyricText:lyric[@"text"]];
 
-    if (isActive) {
+    if (!self.isSynced) {
+        // Plain unsynced lyrics: display every line clearly without dimming or karaoke highlight
+        cell.lyricLabel.attributedText = nil;
+        cell.lyricLabel.text = displayText;
+        cell.lyricLabel.textColor = [UIColor whiteColor];
+        cell.lyricLabel.layer.shadowColor = [UIColor blackColor].CGColor;
+        cell.lyricLabel.layer.shadowOffset = CGSizeMake(0, 1.5);
+        cell.lyricLabel.layer.shadowRadius = 3.0;
+        cell.lyricLabel.layer.shadowOpacity = 0.45;
+        cell.lyricLabel.layer.masksToBounds = NO;
+
+        cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
+    } else if (isActive) {
         if (parts && parts.count > 0) {
             [self applyWordSyncToCell:cell lyric:lyric currentTime:currentTime];
         } else {
@@ -932,7 +958,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         currentTime = g_currentPlaybackTime;
     }
 
-    BOOL isActive = (indexPath.row == self.currentIndex);
+    BOOL isActive = self.isSynced && (indexPath.row == self.currentIndex);
     [self configureCell:cell atIndex:indexPath.row isActive:isActive currentTime:currentTime];
 
     return cell;
@@ -940,6 +966,8 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    if (!self.isSynced) return;
 
     NSDictionary *lyric = self.lyrics[indexPath.row];
     NSNumber *time = lyric[@"time"];
