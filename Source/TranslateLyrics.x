@@ -810,18 +810,30 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     cell.lyricLabel.attributedText = attrStr;
 }
 
+- (NSString *)normalizedLyricText:(NSString *)raw {
+    if (!raw || raw.length == 0) return @"";
+    // Collapse multiple consecutive spaces (from word-boundary artefacts) into one
+    NSArray *tokens = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    NSMutableArray *nonEmpty = [NSMutableArray array];
+    for (NSString *t in tokens) {
+        if (t.length > 0) [nonEmpty addObject:t];
+    }
+    return [nonEmpty componentsJoinedByString:@" "];
+}
+
 - (void)configureCell:(YTMULyricsCell *)cell atIndex:(NSInteger)index isActive:(BOOL)isActive currentTime:(double)currentTime {
     if (index < 0 || index >= self.lyrics.count) return;
 
     NSDictionary *lyric = self.lyrics[index];
     NSArray *parts = lyric[@"parts"];
+    NSString *displayText = [self normalizedLyricText:lyric[@"text"]];
 
     if (isActive) {
         if (parts && parts.count > 0) {
             [self applyWordSyncToCell:cell lyric:lyric currentTime:currentTime];
         } else {
             cell.lyricLabel.attributedText = nil;
-            cell.lyricLabel.text = lyric[@"text"] ?: @"";
+            cell.lyricLabel.text = displayText;
             cell.lyricLabel.textColor = [UIColor whiteColor];
         }
 
@@ -834,7 +846,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
     } else {
         cell.lyricLabel.attributedText = nil;
-        cell.lyricLabel.text = lyric[@"text"] ?: @"";
+        cell.lyricLabel.text = displayText;
         cell.lyricLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.38];
         cell.lyricLabel.layer.shadowOpacity = 0.0;
 

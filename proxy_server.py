@@ -720,7 +720,7 @@ def parse_ttml_basic(ttml_text, duration_sec=0):
                 if p_text:
                     text_parts = [p_text]
             
-            full_text = ''.join(text_parts).strip()
+            full_text = re.sub(r' +', ' ', ''.join(text_parts)).strip()
             if not full_text:
                 continue
             
