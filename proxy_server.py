@@ -348,7 +348,7 @@ def parse_plain(plain_text):
 # ============================================================
 
 def fetch_lrclib(title, artist, album='', duration=0):
-    """Fetch lyrics from LRCLIB. Tries exact match, then search."""
+    """Fetch lyrics from LRCLIB. Tries exact match, then search with strict validation."""
     headers = {'User-Agent': 'YTMusicUltimate/1.0 (https://github.com/user/ytmusicultimate)'}
     
     # Exact match
@@ -359,7 +359,7 @@ def fetch_lrclib(title, artist, album='', duration=0):
         if duration:
             params['duration'] = duration
         
-        resp = requests.get('https://lrclib.net/api/get', params=params, timeout=10, headers=headers)
+        resp = requests.get('https://lrclib.net/api/get', params=params, timeout=8, headers=headers)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('syncedLyrics') or data.get('plainLyrics'):
@@ -370,33 +370,59 @@ def fetch_lrclib(title, artist, album='', duration=0):
                     'instrumental': data.get('instrumental', False)
                 }
     except Exception as e:
-        print(f"[LRCLIB exact] Error: {e}")
+        pass
     
-    # Search fallback
+    # Search fallback with strict verification
     try:
+        q_str = f"{artist} {title}".strip() if artist else title.strip()
         resp = requests.get('https://lrclib.net/api/search',
-                          params={'q': f"{artist} {title}"},
-                          timeout=10, headers=headers)
+                          params={'q': q_str},
+                          timeout=8, headers=headers)
         if resp.status_code == 200:
             results = resp.json()
-            # Prefer synced
-            for r in results:
-                if r.get('syncedLyrics'):
-                    return {
-                        'synced': r['syncedLyrics'],
-                        'plain': r.get('plainLyrics', ''),
-                        'source': 'LRCLib',
-                        'instrumental': r.get('instrumental', False)
-                    }
-            # Fallback to plain
-            for r in results:
-                if r.get('plainLyrics'):
-                    return {
-                        'synced': None,
-                        'plain': r['plainLyrics'],
-                        'source': 'LRCLib',
-                        'instrumental': r.get('instrumental', False)
-                    }
+            if isinstance(results, list):
+                # First pass: find synced lyrics that match duration & artist
+                for r in results:
+                    r_dur = float(r.get('duration', 0) or 0)
+                    r_artist = (r.get('artistName') or '').lower()
+                    a_lower = (artist or '').lower()
+                    
+                    # If duration is known, reject anything differing by > 5 seconds
+                    if duration > 0 and r_dur > 0 and abs(r_dur - duration) > 5:
+                        continue
+                    
+                    # If artist is specified, ensure match unless duration is identical
+                    if a_lower and a_lower not in r_artist and r_artist not in a_lower:
+                        if duration > 0 and abs(r_dur - duration) > 2:
+                            continue
+                    
+                    if r.get('syncedLyrics'):
+                        return {
+                            'synced': r['syncedLyrics'],
+                            'plain': r.get('plainLyrics', ''),
+                            'source': 'LRCLib',
+                            'instrumental': r.get('instrumental', False)
+                        }
+                
+                # Second pass: plain lyrics with same strict match
+                for r in results:
+                    r_dur = float(r.get('duration', 0) or 0)
+                    r_artist = (r.get('artistName') or '').lower()
+                    a_lower = (artist or '').lower()
+                    
+                    if duration > 0 and r_dur > 0 and abs(r_dur - duration) > 5:
+                        continue
+                    if a_lower and a_lower not in r_artist and r_artist not in a_lower:
+                        if duration > 0 and abs(r_dur - duration) > 2:
+                            continue
+                    
+                    if r.get('plainLyrics'):
+                        return {
+                            'synced': None,
+                            'plain': r['plainLyrics'],
+                            'source': 'LRCLib',
+                            'instrumental': r.get('instrumental', False)
+                        }
     except Exception as e:
         print(f"[LRCLIB search] Error: {e}")
     
@@ -408,6 +434,7 @@ def fetch_lrclib(title, artist, album='', duration=0):
 # ============================================================
 
 _ytm = None
+_ytm_ja = None
 
 def get_ytmusic():
     global _ytm
@@ -416,9 +443,16 @@ def get_ytmusic():
         _ytm = YTMusic()
     return _ytm
 
+def get_ytmusic_ja():
+    global _ytm_ja
+    if _ytm_ja is None:
+        from ytmusicapi import YTMusic
+        _ytm_ja = YTMusic(language='ja')
+    return _ytm_ja
+
 
 def get_song_info(video_id):
-    """Get song metadata from YT Music."""
+    """Get song metadata from YT Music with dual-language lookup (EN & JA)."""
     try:
         ytm = get_ytmusic()
         info = ytm.get_song(video_id)
@@ -436,7 +470,26 @@ def get_song_info(video_id):
         except:
             pass
         
-        return {'title': title, 'artist': artist, 'album': album, 'duration': duration}
+        ja_title = ''
+        ja_artist = ''
+        try:
+            ytm_ja = get_ytmusic_ja()
+            info_ja = ytm_ja.get_song(video_id)
+            if info_ja and 'videoDetails' in info_ja:
+                d_ja = info_ja['videoDetails']
+                ja_title = d_ja.get('title', '')
+                ja_artist = d_ja.get('author', '')
+        except:
+            pass
+        
+        return {
+            'title': title,
+            'artist': artist,
+            'ja_title': ja_title,
+            'ja_artist': ja_artist,
+            'album': album,
+            'duration': duration
+        }
     except Exception as e:
         print(f"[ytmusicapi] get_song error: {e}")
         return None
@@ -546,16 +599,16 @@ def fetch_unison(video_id, title='', artist='', duration=0):
             'x-key-id': get_unison_key(),
             'Content-Type': 'application/json'
         }
-        params = {'videoId': video_id}
+        params = {'v': video_id}
         if title:
-            params['title'] = title
+            params['song'] = title
         if artist:
             params['artist'] = artist
         if duration:
             params['duration'] = str(int(duration))
         
         resp = requests.get('https://unison.boidu.dev/lyrics',
-                          params=params, headers=headers, timeout=10)
+                          params=params, headers=headers, timeout=8)
         
         if resp.status_code == 200:
             data = resp.json()
@@ -918,38 +971,71 @@ def google_translate_fast(texts, target_lang='zh-TW'):
 # Metadata Cleaning & Variants
 # ============================================================
 
-def get_search_queries(title, artist):
-    """Generate search variations: raw original, cleaned title/artist, and title-only."""
+def get_search_queries(title, artist, ja_title='', ja_artist=''):
+    """Generate search variations: raw original, with/without cover tags, and Japanese/English variants."""
     queries = []
     seen = set()
 
     def add_q(t, a):
-        t_clean = re.sub(r'\s+', ' ', t).strip(' -_./')
-        a_clean = re.sub(r'\s+', ' ', a).strip(' -_./') if a else ''
+        t_clean = re.sub(r'\s+', ' ', t or '').strip(' -_./')
+        a_clean = re.sub(r'\s+', ' ', a or '').strip(' -_./')
+        if not t_clean or not a_clean:
+            return
         key = (t_clean.lower(), a_clean.lower())
-        if t_clean and key not in seen:
+        if key not in seen:
             seen.add(key)
             queries.append({'title': t_clean, 'artist': a_clean})
 
-    # 1. Original
-    add_q(title, artist)
+    def clean_title(t):
+        if not t: return ''
+        c = t
+        c = re.sub(r'(?i)[/／]\s*(?:covered\s+by|cover\s+by|cover|歌ってみた).*$', '', c)
+        c = re.sub(r'(?i)[/／]\s*[^/／]+$', '', c)
+        c = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official\s*(?:video|audio|music\s*video|mv|lyric\s*video)?|full\s*ver\.?|cover(?:ed)?(?:\s+by[^\)\]\}】」』）］]*)?|remix|mv|audio|feat\.?[^\)\]\}】」』）］]*|ft\.?[^\)\]\}】」』）］]*|歌ってみた|self\s*cover|[^\)\]\}】」』）］]*ver\.?)\s*[\)\]\}】」』）］]', '', c)
+        c = re.sub(r'(?i)\b(?:feat\.?|ft\.?)\s+.*$', '', c)
+        c = re.sub(r'(?i)\s*-\s*(?:cover|official|remix|mv).*$', '', c)
+        return c.strip(' -_./')
 
-    # 2. Filter title and artist
-    # Clean title patterns: (Cover), [Covered by xxx], 【MV】, (Official Video), / Covered by xxx, etc.
-    clean_t = title
-    clean_t = re.sub(r'(?i)[/／]\s*(?:covered\s+by|cover\s+by|cover|歌ってみた).*$', '', clean_t)
-    clean_t = re.sub(r'(?i)[/／]\s*[^/／]+$', '', clean_t)
-    clean_t = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official\s*(?:video|audio|music\s*video|mv|lyric\s*video)?|full\s*ver\.?|cover(?:ed)?(?:\s+by[^\)\]\}】」』）］]*)?|remix|mv|audio|feat\.?[^\)\]\}】」』）］]*|ft\.?[^\)\]\}】」』）］]*|歌ってみた|self\s*cover|[^\)\]\}】」』）］]*ver\.?)\s*[\)\]\}】」』）］]', '', clean_t)
-    clean_t = re.sub(r'(?i)\b(?:feat\.?|ft\.?)\s+.*$', '', clean_t)
-    clean_t = re.sub(r'(?i)\s*-\s*(?:cover|official|remix|mv).*$', '', clean_t)
+    def clean_artist(a):
+        if not a: return ''
+        c = a
+        c = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official|topic|channel|vevo)\s*[\)\]\}】」』）］]', '', c)
+        c = re.sub(r'(?i)\s*-\s*topic$', '', c)
+        return c.strip(' -_./')
 
-    # Clean artist patterns: - Topic, Official, etc.
-    clean_a = artist
-    clean_a = re.sub(r'(?i)[\(\[\{【「『（［]\s*(?:official|topic|channel|vevo)\s*[\)\]\}】」』）］]', '', clean_a)
-    clean_a = re.sub(r'(?i)\s*-\s*topic$', '', clean_a)
+    c_t = clean_title(title)
+    c_a = clean_artist(artist)
 
-    add_q(clean_t, clean_a)
-    add_q(clean_t, '')
+    # 1. Clean title + clean artist
+    add_q(c_t, c_a)
+    # 2. Raw title + clean artist (with cover tags)
+    if title != c_t:
+        add_q(title, c_a)
+    if artist != c_a:
+        add_q(title, artist)
+
+    # 3. Japanese title/artist variants if available
+    if ja_title or ja_artist:
+        c_ja_t = clean_title(ja_title) or c_t
+        c_ja_a = clean_artist(ja_artist) or c_a
+        add_q(c_ja_t, c_ja_a)
+        if ja_title and ja_title != c_ja_t:
+            add_q(ja_title, c_ja_a)
+        # Cross-language (e.g. English title + Japanese artist: Spiral - 明透)
+        add_q(c_t, c_ja_a)
+        # Japanese title + English artist (e.g. アバウト - GIRLS REVOLUTION PROJECT)
+        add_q(c_ja_t, c_a)
+
+    # 4. Extract possible original artist embedded in title (e.g. "アバウト / NAGI" -> artist: NAGI)
+    for t_cand in [title, ja_title]:
+        if not t_cand: continue
+        parts = re.split(r'[/／\-–—]\s*', t_cand)
+        if len(parts) >= 2:
+            p0 = clean_title(parts[0])
+            p1 = clean_title(parts[1])
+            if p0 and p1:
+                add_q(p0, p1)
+                add_q(p1, p0)
 
     return queries
 
@@ -1060,7 +1146,7 @@ def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
     duration = song_info.get('duration', 0)
     result = None
 
-    queries = get_search_queries(song_info['title'], song_info['artist'])
+    queries = get_search_queries(song_info['title'], song_info['artist'], song_info.get('ja_title', ''), song_info.get('ja_artist', ''))
     for q in queries:
         q_title = q['title']
         q_artist = q['artist']
@@ -1108,7 +1194,7 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
     artist = song_info['artist']
     album = song_info.get('album', '')
     duration = song_info.get('duration', 0)
-    queries = get_search_queries(title, artist)
+    queries = get_search_queries(title, artist, song_info.get('ja_title', ''), song_info.get('ja_artist', ''))
     
     result = None
     

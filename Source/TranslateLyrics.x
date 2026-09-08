@@ -5,6 +5,7 @@
 #import "Headers/YTIButtonRenderer.h"
 #import "Headers/YTMNowPlayingViewController.h"
 #import "Headers/ELMNodeController.h"
+#import "Headers/YTMActionRowView.h"
 
 @interface UIView ()
 - (UIViewController *)_viewControllerForAncestor;
@@ -995,18 +996,31 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 %hook YTIButtonRenderer
 
 - (BOOL)isDisabled {
-    // Check if this renderer represents the lyrics button
-    if (self.icon) {
-        NSString *iconDesc = [self.icon description];
-        if ([iconDesc containsString:@"lyrics"] ||
-            [iconDesc containsString:@"format_quote"] ||
-            [iconDesc containsString:@"queue_music"]) {
+    if (self.text) {
+        NSString *t = nil;
+        if ([self.text respondsToSelector:@selector(runs)]) {
+            NSArray *runs = [self.text performSelector:@selector(runs)];
+            if (runs && runs.count > 0) {
+                NSMutableString *ms = [NSMutableString string];
+                for (id r in runs) {
+                    if ([r respondsToSelector:@selector(text)]) {
+                        NSString *rt = [r performSelector:@selector(text)];
+                        if (rt) [ms appendString:rt];
+                    }
+                }
+                t = ms;
+            }
+        }
+        if (!t && [self.text respondsToSelector:@selector(simpleText)]) {
+            t = [self.text performSelector:@selector(simpleText)];
+        }
+        if (t && ([t containsString:@"歌詞"] || [t containsString:@"Lyrics"])) {
             return NO;
         }
     }
-    if (self.text) {
-        NSString *textDesc = [self.text description];
-        if ([textDesc containsString:@"歌詞"] || [textDesc containsString:@"Lyrics"]) {
+    if (self.accessibilityData) {
+        NSString *accDesc = [self.accessibilityData description];
+        if ([accDesc containsString:@"歌詞"] || [accDesc containsString:@"Lyrics"] || [accDesc containsString:@"lyric"]) {
             return NO;
         }
     }
@@ -1022,15 +1036,17 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 - (void)handleTap {
     if (class_getInstanceVariable([self class], "_controller") != NULL) {
         id node = [self valueForKey:@"_controller"];
+        NSString *nodeDesc = [node description];
         if ([node respondsToSelector:@selector(key)]) {
             NSString *key = [node performSelector:@selector(key)];
-            if (key && [key containsString:@"lyric"]) {
-                if (class_getInstanceVariable([self class], "_tapRecognizer") != NULL) {
-                    UIGestureRecognizer *tapRecognizer = [self valueForKey:@"_tapRecognizer"];
-                    UIViewController *vc = [tapRecognizer.view _viewControllerForAncestor];
-                    openLyricsFromViewController(vc);
-                    return;
-                }
+            if (key) nodeDesc = [NSString stringWithFormat:@"%@ %@", key, nodeDesc];
+        }
+        if ([nodeDesc containsString:@"lyric"] || [nodeDesc containsString:@"format_quote"] || [nodeDesc containsString:@"queue_music"]) {
+            if (class_getInstanceVariable([self class], "_tapRecognizer") != NULL) {
+                UIGestureRecognizer *tapRecognizer = [self valueForKey:@"_tapRecognizer"];
+                UIViewController *vc = [tapRecognizer.view _viewControllerForAncestor];
+                openLyricsFromViewController(vc);
+                return;
             }
         }
     }
@@ -1040,13 +1056,29 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 %end
 
 
-// Make the "沒有歌詞" bottom view in Now Playing clickable to open our lyrics
+// Hook YTMActionRowView to unlock lyrics chip
+%hook YTMActionRowView
+
+- (void)layoutSubviews {
+    %orig;
+    UIViewController *vc = [self _viewControllerForAncestor];
+    if (vc && [vc respondsToSelector:@selector(ytmu_makeLyricsViewClickable:)]) {
+        for (UIView *sub in self.subviews) {
+            [(YTMNowPlayingViewController *)vc ytmu_makeLyricsViewClickable:sub];
+        }
+    }
+}
+
+%end
+
+
+// Make the lyrics button and bottom view in Now Playing always active & clickable
 %hook YTMNowPlayingViewController
 
 - (void)viewDidLayoutSubviews {
     %orig;
 
-    // Search view hierarchy for any bottom view displaying "沒有歌詞" or "歌詞"
+    // Search view hierarchy for any button or bottom view displaying "歌詞" or "Lyrics"
     for (UIView *sub in self.view.subviews) {
         [self ytmu_makeLyricsViewClickable:sub];
     }
@@ -1054,22 +1086,56 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 
 %new
 - (void)ytmu_makeLyricsViewClickable:(UIView *)v {
+    if (!v) return;
+
+    BOOL isLyrics = NO;
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)v;
-        if ([lbl.text containsString:@"沒有歌詞"] || [lbl.text containsString:@"歌詞"] || [lbl.text containsString:@"Lyrics"] || [lbl.text containsString:@"unavailable"]) {
-            lbl.userInteractionEnabled = YES;
-            if (lbl.gestureRecognizers.count == 0) {
-                UITapGestureRecognizer *tapLbl = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
-                [lbl addGestureRecognizer:tapLbl];
-            }
-            UIView *container = lbl.superview;
-            if (container && container.gestureRecognizers.count == 0) {
-                container.userInteractionEnabled = YES;
-                UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
-                [container addGestureRecognizer:tap];
-            }
+        NSString *txt = lbl.text ?: lbl.attributedText.string;
+        if ([txt containsString:@"歌詞"] || [txt containsString:@"Lyrics"] || [txt containsString:@"沒有歌詞"] || [txt containsString:@"unavailable"]) {
+            isLyrics = YES;
         }
     }
+    if (!isLyrics && v.accessibilityLabel) {
+        if ([v.accessibilityLabel containsString:@"歌詞"] || [v.accessibilityLabel containsString:@"Lyrics"]) {
+            isLyrics = YES;
+        }
+    }
+    if (!isLyrics && [v respondsToSelector:@selector(titleForState:)]) {
+        NSString *title = [(UIButton *)v titleForState:UIControlStateNormal];
+        if ([title containsString:@"歌詞"] || [title containsString:@"Lyrics"]) {
+            isLyrics = YES;
+        }
+    }
+
+    if (isLyrics) {
+        // Trace up to the button container view (chip)
+        UIView *btn = v;
+        while (btn.superview && btn.superview != self.view && btn.bounds.size.width < 140) {
+            btn = btn.superview;
+        }
+
+        // Force button and subviews to full opacity and enabled interaction
+        btn.userInteractionEnabled = YES;
+        btn.alpha = 1.0;
+        if ([btn isKindOfClass:[UIControl class]]) {
+            [(UIControl *)btn setEnabled:YES];
+        }
+        for (UIView *child in btn.subviews) {
+            child.userInteractionEnabled = YES;
+            child.alpha = 1.0;
+        }
+
+        // Attach custom tap recognizer directly to button
+        if (!objc_getAssociatedObject(btn, @selector(ytmu_didTapLyricsBar:))) {
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
+            tap.cancelsTouchesInView = YES;
+            [btn addGestureRecognizer:tap];
+            objc_setAssociatedObject(btn, @selector(ytmu_didTapLyricsBar:), tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
+
     for (UIView *child in v.subviews) {
         [self ytmu_makeLyricsViewClickable:child];
     }
