@@ -156,30 +156,39 @@ static void sendUIDump(void) {
     };
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (jsonData) {
+        sendDebugLog(@"📸 Screenshot detected, uploading UI dump...");
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://ytmtranslate.chiuhuang.dev/log"]];
         req.HTTPMethod = @"POST";
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
         req.HTTPBody = jsonData;
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req] resume];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
+            if (err) {
+                sendDebugLog([NSString stringWithFormat:@"❌ UI Dump upload failed: %@", err.localizedDescription]);
+            } else {
+                sendDebugLog(@"✅ UI Dump uploaded successfully!");
+            }
+        }] resume];
     }
 }
 
-%hook YTAppDelegate
+%hook YTMAppDelegate
 - (BOOL)application:(id)app didFinishLaunchingWithOptions:(id)options {
     BOOL result = %orig;
     // Pre-warm the JWT token in background at launch
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:nil];
     });
-
-    // Register screenshot listener to automatically upload UI structure and diagnostics
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        sendUIDump();
-    }];
-
     return result;
 }
 %end
+
+%ctor {
+    %init;
+    // Register screenshot listener at tweak load so it never misses app startup
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        sendUIDump();
+    }];
+}
 
 // Hook 2: 攔截靜態歌詞的 Cell (如果還存在的話)
 %hook YTMLightweightMusicDescriptionShelfCell
@@ -1009,34 +1018,89 @@ static UIViewController *topMostViewController(void) {
     return top;
 }
 
-static void openLyricsFromViewController(UIViewController *parentVC) {
-    if (!parentVC) {
-        parentVC = topMostViewController();
+static BOOL isLyricsEngagementPanel(UIViewController *vc) {
+    if (!vc) return NO;
+    id obj = (id)vc;
+
+    // 1. Check panelIdentifier or identifier property
+    if ([obj respondsToSelector:@selector(panelIdentifier)]) {
+        NSString *pid = [obj performSelector:@selector(panelIdentifier)];
+        if ([pid.lowercaseString containsString:@"lyric"]) return YES;
     }
 
-    // 1. Try opening native engagement panel if available
-    if (g_activeEngagementPanelContainer) {
-        if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:animated:)]) {
-            [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:animated:) withObject:@"PAmusic_watch_lyrics_panel" withObject:(id)kCFBooleanTrue];
-        } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:)]) {
-            [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:) withObject:@"PAmusic_watch_lyrics_panel"];
-        } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(openEngagementPanelWithIdentifier:animated:)]) {
-            [g_activeEngagementPanelContainer performSelector:@selector(openEngagementPanelWithIdentifier:animated:) withObject:@"PAmusic_watch_lyrics_panel" withObject:(id)kCFBooleanTrue];
+    // 2. Check model description
+    if ([obj respondsToSelector:@selector(model)]) {
+        id model = [obj performSelector:@selector(model)];
+        if (model) {
+            NSString *desc = [model description].lowercaseString;
+            if ([desc containsString:@"lyric"]) return YES;
         }
     }
 
-    // 2. Fallback check: if native panel didn't open within 0.25s, present YTMULyricsViewController as bottom sheet
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIViewController *presenter = parentVC ?: topMostViewController();
-        if (!presenter) return;
+    // 3. Check vc title
+    if (vc.title && (
+        [vc.title containsString:@"歌詞"] ||
+        [vc.title containsString:@"歌词"] ||
+        [vc.title.lowercaseString containsString:@"lyric"])) {
+        return YES;
+    }
 
-        if ([presenter.presentedViewController isKindOfClass:[YTMULyricsViewController class]]) return;
+    // 4. Check subviews for YTEngagementPanelHeaderView title label
+    for (UIView *sub in vc.view.subviews) {
+        if ([NSStringFromClass([sub class]) containsString:@"EngagementPanelHeader"]) {
+            for (UIView *hSub in sub.subviews) {
+                if ([hSub isKindOfClass:[UILabel class]]) {
+                    NSString *htxt = [(UILabel *)hSub text];
+                    if (htxt && (
+                        [htxt containsString:@"歌詞"] ||
+                        [htxt containsString:@"歌词"] ||
+                        [htxt.lowercaseString containsString:@"lyric"])) {
+                        return YES;
+                    }
+                }
+            }
+        }
+    }
 
-        UIView *existingPanel = [presenter.view viewWithTag:9999];
-        if (existingPanel && !existingPanel.hidden && existingPanel.superview) {
+    return NO;
+}
+
+static void openLyricsFromViewController(UIViewController *parentVC) {
+    sendDebugLog(@"🎵 openLyricsFromViewController called");
+
+    if (g_activeEngagementPanelContainer) {
+        NSArray *panelIDs = @[@"PAmusic_watch_lyrics_panel", @"music_watch_lyrics_panel", @"lyrics"];
+        for (NSString *pid in panelIDs) {
+            if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:animated:)]) {
+                [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:animated:) withObject:pid withObject:(id)kCFBooleanTrue];
+                break;
+            } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:)]) {
+                [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:) withObject:pid];
+                break;
+            } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(openEngagementPanelWithIdentifier:animated:)]) {
+                [g_activeEngagementPanelContainer performSelector:@selector(openEngagementPanelWithIdentifier:animated:) withObject:pid withObject:(id)kCFBooleanTrue];
+                break;
+            }
+        }
+    }
+
+    // Fallback: if native panel didn't open within 0.2s, present YTMULyricsViewController as bottom sheet
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIViewController *top = topMostViewController();
+        if (!top) return;
+
+        // Check if an existing lyrics view is already visible in any window
+        UIWindow *win = [UIApplication sharedApplication].keyWindow;
+        UIView *existingLyrics = [win viewWithTag:9999];
+        if (existingLyrics && !existingLyrics.hidden && existingLyrics.window) {
             return;
         }
 
+        if ([top isKindOfClass:[YTMULyricsViewController class]] || [top.presentedViewController isKindOfClass:[YTMULyricsViewController class]]) {
+            return;
+        }
+
+        sendDebugLog(@"🎵 Presenting fallback YTMULyricsViewController bottom sheet");
         YTMULyricsViewController *lyricsVC = [[YTMULyricsViewController alloc] init];
         lyricsVC.isModal = YES;
         lyricsVC.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -1048,7 +1112,7 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
         if (g_currentVideoID) {
             [lyricsVC fetchLyricsForVideo:g_currentVideoID];
         }
-        [presenter presentViewController:lyricsVC animated:YES completion:nil];
+        [top presentViewController:lyricsVC animated:YES completion:nil];
     });
 }
 
@@ -1074,14 +1138,7 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
     %orig;
 
     UIViewController *vc = (UIViewController *)self;
-    id obj = (id)self;
-
-    id model = nil;
-    if ([obj respondsToSelector:@selector(model)]) {
-        model = [obj performSelector:@selector(model)];
-    }
-
-    if (model && [[model description] containsString:@"PAmusic_watch_lyrics_panel"]) {
+    if (isLyricsEngagementPanel(vc)) {
         UIView *contentContainer = nil;
         for (UIView *sub in vc.view.subviews) {
             if (![NSStringFromClass([sub class]) isEqualToString:@"YTEngagementPanelHeaderView"]) {
@@ -1118,14 +1175,7 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
     %orig;
 
     UIViewController *vc = (UIViewController *)self;
-    id obj = (id)self;
-
-    id model = nil;
-    if ([obj respondsToSelector:@selector(model)]) {
-        model = [obj performSelector:@selector(model)];
-    }
-
-    if (model && [[model description] containsString:@"PAmusic_watch_lyrics_panel"]) {
+    if (isLyricsEngagementPanel(vc)) {
         UIView *contentContainer = nil;
         for (UIView *sub in vc.view.subviews) {
             if (![NSStringFromClass([sub class]) isEqualToString:@"YTEngagementPanelHeaderView"]) {
@@ -1136,6 +1186,21 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 
         if (contentContainer) {
             UIView *lyricsView = [contentContainer viewWithTag:9999];
+            YTMULyricsViewController *lyricsVC = objc_getAssociatedObject(contentContainer, @selector(lyricsVC));
+
+            if (!lyricsView || !lyricsVC) {
+                lyricsVC = [[YTMULyricsViewController alloc] init];
+                lyricsVC.view.tag = 9999;
+                lyricsVC.view.frame = contentContainer.bounds;
+                lyricsVC.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                lyricsVC.view.hidden = YES;
+                [contentContainer addSubview:lyricsVC.view];
+                objc_setAssociatedObject(contentContainer, @selector(lyricsVC), lyricsVC, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (g_currentVideoID) {
+                    [lyricsVC fetchLyricsForVideo:g_currentVideoID];
+                }
+            }
+
             if (lyricsView && !lyricsView.hidden) {
                 [contentContainer bringSubviewToFront:lyricsView];
                 lyricsView.frame = contentContainer.bounds;
@@ -1176,15 +1241,19 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
         if (!t && [self.text respondsToSelector:@selector(simpleText)]) {
             t = [self.text performSelector:@selector(simpleText)];
         }
-        if (t && ([t containsString:@"歌詞"] || [t containsString:@"Lyrics"])) {
+        if (t && ([t containsString:@"歌詞"] || [t containsString:@"歌词"] || [t.lowercaseString containsString:@"lyric"])) {
             return NO;
         }
     }
     if (self.accessibilityData) {
         NSString *accDesc = [self.accessibilityData description];
-        if ([accDesc containsString:@"歌詞"] || [accDesc containsString:@"Lyrics"] || [accDesc containsString:@"lyric"]) {
+        if ([accDesc containsString:@"歌詞"] || [accDesc containsString:@"歌词"] || [accDesc.lowercaseString containsString:@"lyric"]) {
             return NO;
         }
+    }
+    NSString *desc = [self description];
+    if ([desc containsString:@"PAmusic_watch_lyrics_panel"] || [desc.lowercaseString containsString:@"lyrics_panel"]) {
+        return NO;
     }
     return %orig;
 }
@@ -1254,44 +1323,61 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)v;
         NSString *txt = lbl.text ?: lbl.attributedText.string;
-        if ([txt containsString:@"歌詞"] || [txt containsString:@"Lyrics"] || [txt containsString:@"沒有歌詞"] || [txt containsString:@"unavailable"]) {
-            isLyrics = YES;
+        if (txt) {
+            NSString *low = txt.lowercaseString;
+            if ([txt containsString:@"歌詞"] || [txt containsString:@"歌词"] || [low containsString:@"lyric"] || [low containsString:@"unavailable"] || [txt containsString:@"沒有歌詞"] || [txt containsString:@"没有歌词"]) {
+                isLyrics = YES;
+            }
         }
     }
     if (!isLyrics && v.accessibilityLabel) {
-        if ([v.accessibilityLabel containsString:@"歌詞"] || [v.accessibilityLabel containsString:@"Lyrics"]) {
+        NSString *low = v.accessibilityLabel.lowercaseString;
+        if ([low containsString:@"歌詞"] || [low containsString:@"歌词"] || [low containsString:@"lyric"]) {
+            isLyrics = YES;
+        }
+    }
+    if (!isLyrics && v.accessibilityIdentifier) {
+        NSString *low = v.accessibilityIdentifier.lowercaseString;
+        if ([low containsString:@"lyric"]) {
             isLyrics = YES;
         }
     }
     if (!isLyrics && [v respondsToSelector:@selector(titleForState:)]) {
         NSString *title = [(UIButton *)v titleForState:UIControlStateNormal];
-        if ([title containsString:@"歌詞"] || [title containsString:@"Lyrics"]) {
-            isLyrics = YES;
+        if (title) {
+            NSString *low = title.lowercaseString;
+            if ([title containsString:@"歌詞"] || [title containsString:@"歌词"] || [low containsString:@"lyric"]) {
+                isLyrics = YES;
+            }
         }
     }
 
     if (isLyrics) {
-        // Trace up to the button container view (chip)
+        // Trace up to the button container view (chip or tab)
         UIView *btn = v;
-        while (btn.superview && btn.superview != self.view && btn.bounds.size.width < 140) {
+        while (btn.superview && btn.superview != self.view && btn.superview.bounds.size.width < 250) {
             btn = btn.superview;
         }
 
-        // Force button and subviews to full opacity and enabled interaction
         btn.userInteractionEnabled = YES;
         btn.alpha = 1.0;
-        if ([btn isKindOfClass:[UIControl class]]) {
-            [(UIControl *)btn setEnabled:YES];
+        if (btn.superview) {
+            btn.superview.userInteractionEnabled = YES;
         }
         for (UIView *child in btn.subviews) {
             child.userInteractionEnabled = YES;
             child.alpha = 1.0;
         }
 
+        if ([btn isKindOfClass:[UIControl class]]) {
+            [(UIControl *)btn setEnabled:YES];
+            [(UIControl *)btn addTarget:self action:@selector(ytmu_didTapLyricsButtonAction:) forControlEvents:UIControlEventTouchUpInside];
+        }
+
         // Attach custom tap recognizer directly to button
         if (!objc_getAssociatedObject(btn, @selector(ytmu_didTapLyricsBar:))) {
             UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
-            tap.cancelsTouchesInView = YES;
+            tap.cancelsTouchesInView = NO;
             [btn addGestureRecognizer:tap];
             objc_setAssociatedObject(btn, @selector(ytmu_didTapLyricsBar:), tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
@@ -1304,7 +1390,14 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 }
 
 %new
+- (void)ytmu_didTapLyricsButtonAction:(id)sender {
+    sendDebugLog(@"🎵 Lyrics button tapped via UIControl");
+    openLyricsFromViewController((UIViewController *)self);
+}
+
+%new
 - (void)ytmu_didTapLyricsBar:(UITapGestureRecognizer *)gesture {
+    sendDebugLog(@"🎵 Lyrics chip tapped via UITapGestureRecognizer");
     openLyricsFromViewController((UIViewController *)self);
 }
 

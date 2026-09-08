@@ -1565,9 +1565,10 @@ def proxy_log():
         req_type = data.get('type', '')
         
         if req_type == "UI_DUMP":
+            os.makedirs("logs", exist_ok=True)
             timestamp = datetime.now().strftime("%H-%M-%S")
             print(f"\n[{timestamp}] 📦 UI Dump received!")
-            
+
             dump_content = data.get('request_body', '')
             filepath = f"logs/UI_DUMP_{timestamp}.txt"
             with open(filepath, "w", encoding="utf-8") as f:
