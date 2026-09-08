@@ -344,6 +344,13 @@ static void sendUIDump(void) {
 - (CGFloat)currentVideoMediaTime;
 @end
 
+@interface YTMNowPlayingViewController (YTMU_Lyrics)
+- (void)ytmu_keepLyricsButtonActive;
+- (void)ytmu_makeLyricsViewClickable:(UIView *)v;
+- (void)ytmu_didTapLyricsButtonAction:(id)sender;
+- (void)ytmu_didTapLyricsBar:(UITapGestureRecognizer *)gesture;
+@end
+
 static __weak id g_activeEngagementPanelContainer = nil;
 static void openLyricsFromViewController(UIViewController *parentVC);
 
