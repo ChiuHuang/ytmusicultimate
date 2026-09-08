@@ -119,39 +119,34 @@ def parse_lrc(lrc_text, duration_sec=0):
         if not text:
             continue
         
-        # Parse word-level sync if present
+        # Parse word-level sync if present (<mm:ss.xx>word)
         parts = []
         word_matches = list(word_regex.finditer(text))
         if word_matches:
-            plain_text = word_regex.sub('', text).strip()
-            fragments = word_regex.split(text)
-            word_parts = []
-            for wi, wm in enumerate(word_matches):
-                word_time = parse_time_tag(wm.group(1), wm.group(1), wm.group(2), wm.group(3))
-                # Get the text fragment after this word tag
-                frag_idx = (wi + 1) * 4  # Each match has 3 groups + the gap
-                # Simpler: just collect word timestamps
-                word_parts.append({'startTimeMs': word_time + offset_ms})
+            # Clean plain text
+            plain_text = re.sub(r'\s+', ' ', word_regex.sub('', text)).strip()
             
-            # Rebuild parts with text
-            raw_fragments = word_regex.split(text)
+            # Find tokens: (<time>) followed by chars up to next tag
+            # e.g. <00:15.67> I <00:16.01> want <00:16.71> you ...
+            tokens = re.findall(r'<(\d+):(\d+)\.(\d+)>([^<]*)', text)
             current_parts = []
-            word_idx = 0
-            for fi, frag in enumerate(raw_fragments):
-                if fi % 4 == 0 and frag.strip():  # Text fragment
-                    start_ms = word_parts[word_idx]['startTimeMs'] if word_idx < len(word_parts) else 0
+            for tm_min, tm_sec, tm_cs, word_str in tokens:
+                w_ms = parse_time_tag(tm_min, tm_min, tm_sec, tm_cs) + offset_ms
+                clean_word = word_str
+                if clean_word:
                     current_parts.append({
-                        'startTimeMs': start_ms,
-                        'words': frag,
+                        'startTimeMs': w_ms,
+                        'words': clean_word,
                         'durationMs': 0
                     })
-                elif fi % 4 != 0:
-                    word_idx += 1
             
-            # Calculate durations for parts
+            # Calculate durations for each word part
             for pi in range(len(current_parts)):
                 if pi < len(current_parts) - 1:
-                    current_parts[pi]['durationMs'] = current_parts[pi+1]['startTimeMs'] - current_parts[pi]['startTimeMs']
+                    dur = current_parts[pi+1]['startTimeMs'] - current_parts[pi]['startTimeMs']
+                    current_parts[pi]['durationMs'] = max(dur, 0)
+                else:
+                    current_parts[pi]['durationMs'] = 500
             
             parts = current_parts
             text = plain_text

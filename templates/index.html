@@ -56,6 +56,17 @@
       background: rgba(var(--mdui-color-primary), 0.25);
       border-left: 4px solid rgb(var(--mdui-color-primary));
     }
+    .lyric-row.active .orig-text {
+      text-shadow: 0 0 12px rgba(255, 255, 255, 0.75);
+    }
+    .part-sung {
+      color: #ffffff;
+      transition: color 0.15s ease;
+    }
+    .part-unsung {
+      color: rgba(255, 255, 255, 0.45);
+      transition: color 0.15s ease;
+    }
     .lyric-row .time-tag {
       font-size: 11px;
       opacity: 0.6;
@@ -307,13 +318,20 @@
         return;
       }
 
-      listEl.innerHTML = currentLyrics.map((line, idx) => `
+      listEl.innerHTML = currentLyrics.map((line, idx) => {
+        let textHtml = '';
+        if (line.parts && line.parts.length > 0) {
+          textHtml = line.parts.map((p, pIdx) => `<span class="part-span part-unsung" data-start="${p.startTimeMs}">${escapeHtml(p.words || '')}</span>`).join('');
+        } else {
+          textHtml = escapeHtml(line.text || '');
+        }
+        return `
         <div class="lyric-row" id="lyric-${idx}" onclick="seekToLine(${line.time}, ${idx})">
           <div class="time-tag">${formatTime(line.time || 0)}</div>
-          <div class="orig-text">${escapeHtml(line.text || '')}</div>
+          <div class="orig-text">${textHtml}</div>
           ${line.translated ? `<div class="trans-text">${escapeHtml(line.translated)}</div>` : ''}
         </div>
-      `).join('');
+      `}).join('');
 
       currentSimTime = 0;
       updatePlaybackUI();
@@ -366,12 +384,30 @@
     }
 
     function highlightActiveLyric(idx) {
+      const curMs = currentSimTime * 1000;
       document.querySelectorAll('.lyric-row').forEach((row, i) => {
         if (i === idx) {
-          row.classList.add('active');
-          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          if (!row.classList.contains('active')) {
+            row.classList.add('active');
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+          // Word sync
+          row.querySelectorAll('.part-span').forEach(span => {
+            const startMs = parseFloat(span.getAttribute('data-start') || '0');
+            if (curMs >= startMs) {
+              span.classList.add('part-sung');
+              span.classList.remove('part-unsung');
+            } else {
+              span.classList.add('part-unsung');
+              span.classList.remove('part-sung');
+            }
+          });
         } else {
           row.classList.remove('active');
+          row.querySelectorAll('.part-span').forEach(span => {
+            span.classList.remove('part-sung');
+            span.classList.add('part-unsung');
+          });
         }
       });
     }
