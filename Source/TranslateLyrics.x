@@ -369,7 +369,9 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     self.tableView.showsVerticalScrollIndicator = NO;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 85.0;
-    self.tableView.contentInset = UIEdgeInsetsMake(60, 0, 350, 0);
+    // Prevent safe-area from adding unexpected insets that fight our manual inset
+    self.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    self.tableView.contentInset = UIEdgeInsetsMake(20, 0, 350, 0);
     [self.tableView registerClass:[YTMULyricsCell class] forCellReuseIdentifier:@"YTMULyricsCell"];
 
     // Header for top spacing and status label
@@ -423,6 +425,30 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
 - (void)dismissModal {
     [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    // Dynamically size the bottom inset so the last row can scroll to the middle of the screen.
+    // We need at least half the visible height as padding below the last row.
+    CGFloat visibleHeight = self.view.bounds.size.height;
+    CGFloat bottomPad = MAX(350.0, visibleHeight * 0.60);
+
+    UIEdgeInsets current = self.tableView.contentInset;
+    if (fabs(current.bottom - bottomPad) > 1.0) {
+        self.tableView.contentInset = UIEdgeInsetsMake(current.top, 0, bottomPad, 0);
+        self.tableView.scrollIndicatorInsets = UIEdgeInsetsMake(0, 0, bottomPad, 0);
+    }
+
+    // Keep a footer view the same height as the bottom inset so the table can
+    // physically scroll the last row into the visible center.
+    UIView *existingFooter = self.tableView.tableFooterView;
+    if (!existingFooter || fabs(existingFooter.frame.size.height - bottomPad) > 1.0) {
+        UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, bottomPad)];
+        footer.backgroundColor = [UIColor clearColor];
+        self.tableView.tableFooterView = footer;
+    }
 }
 
 - (void)dealloc {
@@ -707,8 +733,18 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
     double currentMs = currentTime * 1000.0;
     UIFont *font = [UIFont boldSystemFontOfSize:24];
-    UIColor *sungColor = [UIColor whiteColor];
-    UIColor *unsungColor = [[UIColor whiteColor] colorWithAlphaComponent:0.40];
+
+    // --- Smooth left-to-right wipe effect ---
+    // For each word:
+    //   • Before its start: dim (alpha 0.38)
+    //   • After the next word's start: fully lit (alpha 1.0)
+    //   • In between: linearly interpolate, so the "lit" sweep
+    //     flows smoothly across the line rather than popping.
+    //
+    // To make the transition even softer, we define a "feather" window
+    // that starts 50ms before the word's own startTimeMs.
+    //
+    // Result: the bright region grows character-by-character across the line.
 
     NSMutableAttributedString *attrStr = [[NSMutableAttributedString alloc] init];
 
@@ -718,8 +754,8 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         NSString *w = part[@"words"] ?: @"";
         if (w.length == 0) continue;
 
+        // Build display string with trailing space for Latin words
         NSString *displayWord = w;
-        // Ensure non-CJK words have separating space if missing
         if (idx < parts.count - 1 && ![displayWord hasSuffix:@" "]) {
             NSDictionary *nextPart = parts[idx + 1];
             NSString *nextWord = nextPart[@"words"] ?: @"";
@@ -734,9 +770,36 @@ static void openLyricsFromViewController(UIViewController *parentVC);
             }
         }
 
-        BOOL isSung = (currentMs >= wordStartMs);
-        UIColor *col = isSung ? sungColor : unsungColor;
+        // Compute word-level progress [0..1]
+        // Window: from (wordStartMs - feather) to nextWordStartMs (or wordStartMs+200ms fallback)
+        double nextWordStartMs;
+        if (idx < parts.count - 1) {
+            nextWordStartMs = [parts[idx + 1][@"startTimeMs"] doubleValue];
+        } else {
+            nextWordStartMs = wordStartMs + 250.0; // last word: 250ms window
+        }
 
+        double feather = 60.0; // ms — how early we start brightening before the beat
+        double windowStart = wordStartMs - feather;
+        double windowEnd = nextWordStartMs;
+
+        CGFloat progress; // 0.0 = fully dim, 1.0 = fully lit
+        if (currentMs <= windowStart) {
+            progress = 0.0;
+        } else if (currentMs >= windowEnd) {
+            progress = 1.0;
+        } else {
+            progress = (CGFloat)((currentMs - windowStart) / (windowEnd - windowStart));
+            // Apply a subtle ease-in curve so the wipe accelerates into brightness
+            progress = progress * progress * (3.0 - 2.0 * progress); // smoothstep
+        }
+
+        // Interpolate alpha: 0.38 (dim) → 1.0 (bright)
+        CGFloat dimAlpha = 0.38;
+        CGFloat brightAlpha = 1.0;
+        CGFloat alpha = dimAlpha + progress * (brightAlpha - dimAlpha);
+
+        UIColor *col = [[UIColor whiteColor] colorWithAlphaComponent:alpha];
         NSDictionary *attrs = @{
             NSFontAttributeName: font,
             NSForegroundColorAttributeName: col
