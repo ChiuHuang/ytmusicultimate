@@ -1065,6 +1065,22 @@ static BOOL isLyricsEngagementPanel(UIViewController *vc) {
     return NO;
 }
 
+static BOOL isLyricsViewVisibleOnScreen(void) {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow || w.rootViewController) { win = w; break; }
+        }
+    }
+    if (!win) return NO;
+    UIView *existing = [win viewWithTag:9999];
+    if (!existing || existing.hidden || existing.alpha < 0.05 || !existing.window) return NO;
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+    CGRect r = [existing convertRect:existing.bounds toView:nil];
+    CGRect isect = CGRectIntersection(screenBounds, r);
+    return (isect.size.width > 50 && isect.size.height > 100);
+}
+
 static void openLyricsFromViewController(UIViewController *parentVC) {
     sendDebugLog(@"🎵 openLyricsFromViewController called");
 
@@ -1084,17 +1100,15 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
         }
     }
 
-    // Fallback: if native panel didn't open within 0.2s, present YTMULyricsViewController as bottom sheet
+    // Fallback: if native panel didn't open on screen within 0.2s, present YTMULyricsViewController as bottom sheet
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIViewController *top = topMostViewController();
-        if (!top) return;
-
-        // Check if an existing lyrics view is already visible in any window
-        UIWindow *win = [UIApplication sharedApplication].keyWindow;
-        UIView *existingLyrics = [win viewWithTag:9999];
-        if (existingLyrics && !existingLyrics.hidden && existingLyrics.window) {
+        if (isLyricsViewVisibleOnScreen()) {
+            sendDebugLog(@"🎵 Native lyrics panel already visible on screen, skipping fallback");
             return;
         }
+
+        UIViewController *top = topMostViewController();
+        if (!top) return;
 
         if ([top isKindOfClass:[YTMULyricsViewController class]] || [top.presentedViewController isKindOfClass:[YTMULyricsViewController class]]) {
             return;
@@ -1251,11 +1265,68 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
             return NO;
         }
     }
+    if (self.accessibility) {
+        NSString *accDesc = [self.accessibility description];
+        if ([accDesc containsString:@"歌詞"] || [accDesc containsString:@"歌词"] || [accDesc.lowercaseString containsString:@"lyric"]) {
+            return NO;
+        }
+    }
     NSString *desc = [self description];
-    if ([desc containsString:@"PAmusic_watch_lyrics_panel"] || [desc.lowercaseString containsString:@"lyrics_panel"]) {
+    if ([desc containsString:@"PAmusic_watch_lyrics_panel"] || [desc.lowercaseString containsString:@"lyrics_panel"] || [desc.lowercaseString containsString:@"lyrics"]) {
         return NO;
     }
     return %orig;
+}
+
+- (void)setIsDisabled:(BOOL)disabled {
+    NSString *desc = [self description];
+    if ([desc containsString:@"歌詞"] || [desc containsString:@"歌词"] || [desc.lowercaseString containsString:@"lyric"]) {
+        %orig(NO);
+        return;
+    }
+    %orig(disabled);
+}
+
+%end
+
+
+// Aggressively lock lyrics controls to always enabled, unhidden, and full opacity ("while true set true")
+%hook UIControl
+
+- (void)setEnabled:(BOOL)enabled {
+    if (!enabled && objc_getAssociatedObject(self, @selector(ytmu_isLyricsButton))) {
+        %orig(YES);
+        return;
+    }
+    %orig(enabled);
+}
+
+%end
+
+%hook UIView
+
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    if (!enabled && objc_getAssociatedObject(self, @selector(ytmu_isLyricsButton))) {
+        %orig(YES);
+        return;
+    }
+    %orig(enabled);
+}
+
+- (void)setAlpha:(CGFloat)alpha {
+    if (alpha < 0.8 && objc_getAssociatedObject(self, @selector(ytmu_isLyricsButton))) {
+        %orig(1.0);
+        return;
+    }
+    %orig(alpha);
+}
+
+- (void)setHidden:(BOOL)hidden {
+    if (hidden && objc_getAssociatedObject(self, @selector(ytmu_isLyricsButton))) {
+        %orig(NO);
+        return;
+    }
+    %orig(hidden);
 }
 
 %end
@@ -1308,11 +1379,31 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 
 - (void)viewDidLayoutSubviews {
     %orig;
-
-    // Search view hierarchy for any button or bottom view displaying "歌詞" or "Lyrics"
     for (UIView *sub in self.view.subviews) {
         [self ytmu_makeLyricsViewClickable:sub];
     }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self ytmu_keepLyricsButtonActive];
+}
+
+%new
+- (void)ytmu_keepLyricsButtonActive {
+    for (UIView *sub in self.view.subviews) {
+        [self ytmu_makeLyricsViewClickable:sub];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        for (UIView *sub in self.view.subviews) {
+            [self ytmu_makeLyricsViewClickable:sub];
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        for (UIView *sub in self.view.subviews) {
+            [self ytmu_makeLyricsViewClickable:sub];
+        }
+    });
 }
 
 %new
@@ -1325,7 +1416,7 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
         NSString *txt = lbl.text ?: lbl.attributedText.string;
         if (txt) {
             NSString *low = txt.lowercaseString;
-            if ([txt containsString:@"歌詞"] || [txt containsString:@"歌词"] || [low containsString:@"lyric"] || [low containsString:@"unavailable"] || [txt containsString:@"沒有歌詞"] || [txt containsString:@"没有歌词"]) {
+            if ([txt containsString:@"歌詞"] || [txt containsString:@"歌词"] || [low containsString:@"lyric"] || [low containsString:@"unavailable"] || [txt containsString:@"沒有歌詞"] || [txt containsString:@"没有歌词"] || [txt containsString:@"無歌詞"] || [txt containsString:@"無提供歌詞"]) {
                 isLyrics = YES;
             }
         }
@@ -1359,14 +1450,19 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
             btn = btn.superview;
         }
 
+        // Tag button and all subviews with ytmu_isLyricsButton so hooks persistently force them active
+        objc_setAssociatedObject(btn, @selector(ytmu_isLyricsButton), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         btn.userInteractionEnabled = YES;
         btn.alpha = 1.0;
+        btn.hidden = NO;
         if (btn.superview) {
             btn.superview.userInteractionEnabled = YES;
         }
         for (UIView *child in btn.subviews) {
+            objc_setAssociatedObject(child, @selector(ytmu_isLyricsButton), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             child.userInteractionEnabled = YES;
             child.alpha = 1.0;
+            child.hidden = NO;
         }
 
         if ([btn isKindOfClass:[UIControl class]]) {
@@ -1380,6 +1476,16 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
             tap.cancelsTouchesInView = NO;
             [btn addGestureRecognizer:tap];
             objc_setAssociatedObject(btn, @selector(ytmu_didTapLyricsBar:), tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        // Also attach tap recognizer directly to label / subview as a direct touch target
+        if (v != btn && !objc_getAssociatedObject(v, @selector(ytmu_didTapLyricsBar:))) {
+            v.userInteractionEnabled = YES;
+            objc_setAssociatedObject(v, @selector(ytmu_isLyricsButton), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            UITapGestureRecognizer *lblTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
+            lblTap.cancelsTouchesInView = NO;
+            [v addGestureRecognizer:lblTap];
+            objc_setAssociatedObject(v, @selector(ytmu_didTapLyricsBar:), lblTap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         return;
     }
