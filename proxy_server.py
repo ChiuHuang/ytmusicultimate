@@ -138,8 +138,47 @@ if not os.path.exists('logs'):
     os.makedirs('logs')
 
 # ============================================================
-# LRC Parser
+# LRC Parser & Karaoke Interpolation
 # ============================================================
+
+def is_cjk(text):
+    for c in text:
+        if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff':
+            return True
+    return False
+
+def generate_interpolated_parts(text, start_ms, duration_ms):
+    """Generate proportional word/character timestamps across line duration when provider lacks word-sync."""
+    if not text or duration_ms <= 200:
+        return []
+    text = text.strip()
+    if is_cjk(text):
+        tokens = [c for c in text if c.strip()]
+        if not tokens: return []
+        parts = []
+        for c in tokens:
+            parts.append({'words': c, 'weight': 1})
+    else:
+        words = text.split()
+        if not words: return []
+        parts = []
+        for i, w in enumerate(words):
+            display = w + (' ' if i < len(words) - 1 else '')
+            parts.append({'words': display, 'weight': max(len(w), 1)})
+
+    total_weight = sum(p['weight'] for p in parts)
+    sung_dur = max(duration_ms * 0.88, duration_ms - 400) if duration_ms > 800 else duration_ms
+    curr_ms = start_ms
+    res = []
+    for p in parts:
+        p_dur = max(100, int(sung_dur * (p['weight'] / total_weight)))
+        res.append({
+            'startTimeMs': curr_ms,
+            'words': p['words'],
+            'durationMs': p_dur
+        })
+        curr_ms += p_dur
+    return res
 
 def parse_lrc(lrc_text, duration_sec=0):
     """Parse LRC format into structured JSON array.
@@ -153,16 +192,16 @@ def parse_lrc(lrc_text, duration_sec=0):
     word_regex = re.compile(r'<(\d+):(\d+)\.(\d+)>')
     id_tag_regex = re.compile(r'^\[(\w+):(.*)\]$')
     
-    def parse_time_tag(m, g, s, cs):
+    def parse_time_tag(m, s, cs):
         minutes = int(m)
         seconds = int(s)
-        cs_str = cs
+        cs_str = str(cs)
         if len(cs_str) == 2:
             ms = int(cs_str) * 10
-        elif len(cs_str) == 3:
-            ms = int(cs_str)
+        elif len(cs_str) == 1:
+            ms = int(cs_str) * 100
         else:
-            ms = int(cs_str)
+            ms = int(cs_str[:3])
         return minutes * 60000 + seconds * 1000 + ms
     
     for line in lines:
@@ -194,15 +233,24 @@ def parse_lrc(lrc_text, duration_sec=0):
         parts = []
         word_matches = list(word_regex.finditer(text))
         if word_matches:
-            # Clean plain text
             plain_text = re.sub(r'\s+', ' ', word_regex.sub('', text)).strip()
             
-            # Find tokens: (<time>) followed by chars up to next tag
-            # e.g. <00:15.67> I <00:16.01> want <00:16.71> you ...
-            tokens = re.findall(r'<(\d+):(\d+)\.(\d+)>([^<]*)', text)
+            # Check for leading text before first tag
+            first_match = word_matches[0]
             current_parts = []
+            if first_match.start() > 0:
+                lead = text[:first_match.start()].strip()
+                if lead:
+                    current_parts.append({
+                        'startTimeMs': 0, # Will be set to line start_ms
+                        'words': lead + (' ' if not is_cjk(lead) else ''),
+                        'durationMs': 0
+                    })
+            
+            # Find tokens: (<time>) followed by chars up to next tag
+            tokens = re.findall(r'<(\d+):(\d+)\.(\d+)>([^<]*)', text)
             for tm_min, tm_sec, tm_cs, word_str in tokens:
-                w_ms = parse_time_tag(tm_min, tm_min, tm_sec, tm_cs) + offset_ms
+                w_ms = parse_time_tag(tm_min, tm_sec, tm_cs) + offset_ms
                 clean_word = word_str
                 if clean_word:
                     current_parts.append({
@@ -223,7 +271,15 @@ def parse_lrc(lrc_text, duration_sec=0):
             text = plain_text
         
         for tm in time_matches:
-            start_ms = parse_time_tag(tm.group(1), tm.group(1), tm.group(2), tm.group(3)) + offset_ms
+            start_ms = parse_time_tag(tm.group(1), tm.group(2), tm.group(3)) + offset_ms
+            
+            entry_parts = []
+            if parts:
+                import copy
+                entry_parts = copy.deepcopy(parts)
+                # If first part was leading text with 0, bind to start_ms
+                if entry_parts and entry_parts[0]['startTimeMs'] == 0:
+                    entry_parts[0]['startTimeMs'] = start_ms
             
             entry = {
                 'time': round(start_ms / 1000.0, 3),
@@ -231,8 +287,8 @@ def parse_lrc(lrc_text, duration_sec=0):
                 'text': text,
                 'durationMs': 0
             }
-            if parts:
-                entry['parts'] = parts
+            if entry_parts:
+                entry['parts'] = entry_parts
             
             result.append(entry)
     
@@ -247,6 +303,25 @@ def parse_lrc(lrc_text, duration_sec=0):
         else:
             result[i]['durationMs'] = max(int(duration_ms - result[i]['startTimeMs']), 3000)
         result[i]['duration'] = round(result[i]['durationMs'] / 1000.0, 3)
+        
+        # Ensure every line has parts for word karaoke
+        if not result[i].get('parts') or len(result[i]['parts']) == 0:
+            result[i]['parts'] = generate_interpolated_parts(result[i]['text'], result[i]['startTimeMs'], result[i]['durationMs'])
+        else:
+            # Sanitize existing parts
+            p_list = result[i]['parts']
+            l_start = result[i]['startTimeMs']
+            prev_ms = l_start
+            for pi, p in enumerate(p_list):
+                if not p.get('startTimeMs') or p['startTimeMs'] < l_start:
+                    p['startTimeMs'] = prev_ms + (0 if pi == 0 else 200)
+                prev_ms = p['startTimeMs']
+            for pi in range(len(p_list)):
+                if pi < len(p_list) - 1:
+                    dur = p_list[pi+1]['startTimeMs'] - p_list[pi]['startTimeMs']
+                    p_list[pi]['durationMs'] = max(dur, 0)
+                else:
+                    p_list[pi]['durationMs'] = max(result[i]['startTimeMs'] + result[i]['durationMs'] - p_list[pi]['startTimeMs'], 200)
     
     return result
 
@@ -556,32 +631,56 @@ def parse_ttml_basic(ttml_text, duration_sec=0):
             # Check for spans (word-level sync)
             spans = list(p.iter('span'))
             if spans:
-                for span in spans:
+                for idx, span in enumerate(spans):
                     span_begin = span.get('begin', '')
                     span_end = span.get('end', '')
-                    span_text = (span.text or '').strip()
+                    span_text = (span.text or '')
+                    tail_text = (span.tail or '')
                     
-                    if span_text:
-                        text_parts.append(span_text)
+                    # Preserving spacing between words
+                    clean_word = span_text
+                    if tail_text and ' ' in tail_text:
+                        if not clean_word.endswith(' '):
+                            clean_word += ' '
+                    elif not is_cjk(clean_word) and idx < len(spans) - 1:
+                        if not clean_word.endswith(' '):
+                            clean_word += ' '
+                    
+                    if clean_word.strip():
+                        text_parts.append(clean_word)
                         if span_begin:
+                            s_begin_ms = parse_ttml_time(span_begin)
+                            # Handle relative timestamp (e.g. begin="0.5s" in a line starting at 40s)
+                            if s_begin_ms < start_ms:
+                                s_begin_ms = start_ms + s_begin_ms
+                            s_end_ms = parse_ttml_time(span_end) if span_end else 0
+                            if s_end_ms > 0 and s_end_ms < start_ms:
+                                s_end_ms = start_ms + s_end_ms
+                            dur_ms = s_end_ms - s_begin_ms if s_end_ms > s_begin_ms else 0
                             parts.append({
-                                'startTimeMs': parse_ttml_time(span_begin),
-                                'words': span_text,
-                                'durationMs': parse_ttml_time(span_end) - parse_ttml_time(span_begin) if span_end else 0
+                                'startTimeMs': s_begin_ms,
+                                'words': clean_word,
+                                'durationMs': dur_ms
                             })
             else:
-                text_parts = [(p.text or '').strip()]
+                p_text = (p.text or '').strip()
+                if p_text:
+                    text_parts = [p_text]
             
-            full_text = ' '.join(t for t in text_parts if t)
+            full_text = ''.join(text_parts).strip()
             if not full_text:
                 continue
+            
+            line_duration_ms = end_ms - start_ms
+            if not parts or len(parts) == 0:
+                parts = generate_interpolated_parts(full_text, start_ms, line_duration_ms)
             
             entry = {
                 'time': round(start_ms / 1000.0, 3),
                 'startTimeMs': start_ms,
                 'text': full_text,
-                'durationMs': end_ms - start_ms,
-                'duration': round((end_ms - start_ms) / 1000.0, 3)
+                'durationMs': line_duration_ms,
+                'duration': round(line_duration_ms / 1000.0, 3)
             }
             if parts:
                 entry['parts'] = parts
@@ -595,12 +694,27 @@ def parse_ttml_basic(ttml_text, duration_sec=0):
 
 
 def parse_ttml_time(time_str):
-    """Parse TTML time format (HH:MM:SS.mmm or seconds) to milliseconds."""
+    """Parse TTML time format (HH:MM:SS.mmm, MM:SS.mmm, seconds with 's', or milliseconds with 'ms') to milliseconds."""
     if not time_str:
         return 0
+    time_str = str(time_str).strip().replace(',', '.')
     
-    # Format: HH:MM:SS.mmm or MM:SS.mmm
-    parts = time_str.replace(',', '.').split(':')
+    # Check for milliseconds suffix: e.g. "1234ms"
+    if time_str.endswith('ms'):
+        try:
+            return int(float(time_str[:-2]))
+        except:
+            return 0
+            
+    # Check for seconds suffix: e.g. "12.34s"
+    if time_str.endswith('s'):
+        try:
+            return int(float(time_str[:-1]) * 1000)
+        except:
+            return 0
+            
+    # Check for HH:MM:SS.mmm or MM:SS.mmm
+    parts = time_str.split(':')
     try:
         if len(parts) == 3:
             h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
@@ -856,6 +970,32 @@ def is_not_found_result(data):
         return True
     return False
 
+def sanitize_lyrics_parts(lyrics):
+    """Ensure every line has valid, monotonically increasing parts with proper durations and spaces."""
+    if not lyrics:
+        return
+    for l in lyrics:
+        if not l.get('text'):
+            continue
+        l_ms = int(l.get('startTimeMs', l.get('time', 0) * 1000))
+        l_dur = int(l.get('durationMs', l.get('duration', 0) * 1000))
+        parts = l.get('parts')
+        if not parts or len(parts) == 0:
+            if l_dur > 0:
+                l['parts'] = generate_interpolated_parts(l['text'], l_ms, l_dur)
+        else:
+            prev_ms = l_ms
+            for pi, p in enumerate(parts):
+                if not p.get('startTimeMs') or p['startTimeMs'] < l_ms:
+                    p['startTimeMs'] = prev_ms + (0 if pi == 0 else 200)
+                prev_ms = p['startTimeMs']
+            for pi in range(len(parts)):
+                if pi < len(parts) - 1:
+                    dur = parts[pi+1]['startTimeMs'] - parts[pi]['startTimeMs']
+                    parts[pi]['durationMs'] = max(dur, 0)
+                else:
+                    parts[pi]['durationMs'] = max(l_ms + l_dur - parts[pi]['startTimeMs'], 200)
+
 def get_cached(video_id):
     path = f"cache/lyrics/{video_id}.json"
     if os.path.exists(path):
@@ -866,14 +1006,7 @@ def get_cached(video_id):
             if is_not_found_result(data):
                 return None
             if data and data.get('lyrics'):
-                for l in data['lyrics']:
-                    if l.get('parts'):
-                        l_ms = int(l.get('time', 0) * 1000)
-                        prev_ms = l_ms
-                        for pi, p in enumerate(l['parts']):
-                            if not p.get('startTimeMs') or p['startTimeMs'] < l_ms:
-                                p['startTimeMs'] = prev_ms + (0 if pi == 0 else 250)
-                            prev_ms = p['startTimeMs']
+                sanitize_lyrics_parts(data['lyrics'])
             ts = datetime.fromisoformat(entry['ts'])
             if (datetime.now() - ts).total_seconds() < 86400 * 3:
                 return data
@@ -963,6 +1096,9 @@ def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
             if i < len(translations) and translations[i]:
                 lyric['translated'] = translations[i]
 
+    if result and result.get('lyrics'):
+        sanitize_lyrics_parts(result['lyrics'])
+
     return result
 
 def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
@@ -997,6 +1133,8 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
                     for i, lyric in enumerate(result['lyrics']):
                         if i < len(translations):
                             lyric['translated'] = translations[i]
+                if result and result.get('lyrics'):
+                    sanitize_lyrics_parts(result['lyrics'])
                 return result
     
     # Priority 1: LRCLIB (best for synced lyrics)
@@ -1075,6 +1213,9 @@ def fetch_all_lyrics(video_id, song_info, translate_to=None, jwt_token=None):
             if i < len(translations):
                 lyric['translated'] = translations[i]
     
+    if result and result.get('lyrics'):
+        sanitize_lyrics_parts(result['lyrics'])
+
     return result
 
 

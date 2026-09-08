@@ -561,8 +561,14 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     if (self.lyrics.count == 0) return;
 
     double currentTime = 0;
-    if (g_activePlayer && [g_activePlayer respondsToSelector:@selector(currentVideoMediaTime)]) {
-        currentTime = [g_activePlayer currentVideoMediaTime];
+    if (g_activePlayer) {
+        if ([g_activePlayer respondsToSelector:@selector(currentVideoMediaTime)]) {
+            currentTime = [g_activePlayer currentVideoMediaTime];
+        } else if ([g_activePlayer respondsToSelector:@selector(currentMediaTime)]) {
+            currentTime = [g_activePlayer currentMediaTime];
+        }
+    }
+    if (currentTime > 0) {
         g_currentPlaybackTime = currentTime;
     } else {
         currentTime = g_currentPlaybackTime;
@@ -582,7 +588,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         }
     }
 
-    if (newIndex != self.currentIndex && newIndex != -1) {
+    if (newIndex != self.currentIndex) {
         NSInteger oldIndex = self.currentIndex;
         self.currentIndex = newIndex;
 
@@ -701,14 +707,31 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     double currentMs = currentTime * 1000.0;
     UIFont *font = [UIFont boldSystemFontOfSize:24];
     UIColor *sungColor = [UIColor whiteColor];
-    UIColor *unsungColor = [[UIColor whiteColor] colorWithAlphaComponent:0.42];
+    UIColor *unsungColor = [[UIColor whiteColor] colorWithAlphaComponent:0.40];
 
     NSMutableAttributedString *attrStr = [[NSMutableAttributedString alloc] init];
 
-    for (NSDictionary *part in parts) {
+    for (NSUInteger idx = 0; idx < parts.count; idx++) {
+        NSDictionary *part = parts[idx];
         double wordStartMs = [part[@"startTimeMs"] doubleValue];
         NSString *w = part[@"words"] ?: @"";
         if (w.length == 0) continue;
+
+        NSString *displayWord = w;
+        // Ensure non-CJK words have separating space if missing
+        if (idx < parts.count - 1 && ![displayWord hasSuffix:@" "]) {
+            NSDictionary *nextPart = parts[idx + 1];
+            NSString *nextWord = nextPart[@"words"] ?: @"";
+            if (![nextWord hasPrefix:@" "]) {
+                BOOL isLatin = NO;
+                for (NSUInteger ci = 0; ci < displayWord.length; ci++) {
+                    if ([displayWord characterAtIndex:ci] < 0x2E80) { isLatin = YES; break; }
+                }
+                if (isLatin) {
+                    displayWord = [displayWord stringByAppendingString:@" "];
+                }
+            }
+        }
 
         BOOL isSung = (currentMs >= wordStartMs);
         UIColor *col = isSung ? sungColor : unsungColor;
@@ -717,7 +740,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
             NSFontAttributeName: font,
             NSForegroundColorAttributeName: col
         };
-        [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:w attributes:attrs]];
+        [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:displayWord attributes:attrs]];
     }
 
     cell.lyricLabel.attributedText = attrStr;
@@ -738,20 +761,20 @@ static void openLyricsFromViewController(UIViewController *parentVC);
             cell.lyricLabel.textColor = [UIColor whiteColor];
         }
 
-        cell.lyricLabel.layer.shadowColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
-        cell.lyricLabel.layer.shadowOffset = CGSizeZero;
-        cell.lyricLabel.layer.shadowRadius = 6.0;
-        cell.lyricLabel.layer.shadowOpacity = 0.7;
+        cell.lyricLabel.layer.shadowColor = [UIColor blackColor].CGColor;
+        cell.lyricLabel.layer.shadowOffset = CGSizeMake(0, 1.5);
+        cell.lyricLabel.layer.shadowRadius = 3.0;
+        cell.lyricLabel.layer.shadowOpacity = 0.5;
         cell.lyricLabel.layer.masksToBounds = NO;
 
         cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
     } else {
         cell.lyricLabel.attributedText = nil;
         cell.lyricLabel.text = lyric[@"text"] ?: @"";
-        cell.lyricLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45];
+        cell.lyricLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.38];
         cell.lyricLabel.layer.shadowOpacity = 0.0;
 
-        cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.28];
+        cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.24];
     }
 
     NSString *translated = lyric[@"translated"];
