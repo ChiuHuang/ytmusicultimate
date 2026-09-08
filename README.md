@@ -10,6 +10,8 @@
 <p align="center">
 The best tweak for the YouTube Music on iOS.
 </p>
+traslate addon
+<img width="1284" height="2778" alt="image" src="https://github.com/user-attachments/assets/d24dae25-171d-4868-96af-351c5122435a" />
 
 ## Download Links
 
