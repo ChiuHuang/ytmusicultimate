@@ -76,21 +76,6 @@
       font-weight: 400;
       font-size: 14px;
     }
-    .part-span {
-      display: inline;
-      transition: color 0.12s ease;
-    }
-    .part-sung {
-      color: #ffffff;
-      font-weight: 700;
-    }
-    .part-unsung {
-      color: rgba(255, 255, 255, 0.35);
-      font-weight: 700;
-    }
-    .lyric-row.past .part-sung {
-      color: rgba(255, 255, 255, 0.5);
-    }
     .lyric-row .time-tag {
       font-size: 11px;
       opacity: 0.4;
@@ -201,6 +186,14 @@
     .badge-synced { background: rgba(76, 175, 80, 0.2); color: #81c784; }
     .badge-plain { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
     .badge-none { background: rgba(244, 67, 54, 0.2); color: #e57373; }
+    .preview-player {
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -250,10 +243,11 @@
               <div id="sourceBadge"></div>
             </div>
 
-            <!-- Audio / Playback simulator -->
+            <!-- YouTube playback controls -->
+            <div id="youtubePlayer" class="preview-player" aria-hidden="true"></div>
             <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
-              <mdui-button-icon icon="play_circle" id="playSimBtn" onclick="togglePlaySim()"></mdui-button-icon>
-              <mdui-slider id="timeSlider" min="0" max="300" value="0" style="flex: 1;" oninput="onSeek(this.value)"></mdui-slider>
+              <mdui-button-icon icon="play_circle" id="playSimBtn" title="Play preview" onclick="togglePlayback()"></mdui-button-icon>
+              <mdui-slider id="timeSlider" min="0" max="300" value="0" style="flex: 1;" oninput="onSeek(this.value)" disabled></mdui-slider>
               <span id="timeDisplay" style="font-size: 12px; font-family: monospace; width: 65px; text-align: right;">0:00 / 0:00</span>
             </div>
 
@@ -314,10 +308,22 @@
 
   <script>
     let currentLyrics = [];
-    let playbackInterval = null;
     let isPlaying = false;
     let currentSimTime = 0;
     let songDuration = 0;
+    let youtubePlayer = null;
+    let pendingVideoId = '';
+    let isSeeking = false;
+
+    const youtubeApiPromise = new Promise(resolve => {
+      window.onYouTubeIframeAPIReady = () => {
+        resolve();
+      };
+      const script = document.createElement('script');
+      script.src = 'https://www.youtube.com/iframe_api';
+      script.async = true;
+      document.head.appendChild(script);
+    });
 
     function toggleTheme() {
       const html = document.documentElement;
@@ -367,6 +373,7 @@
       document.getElementById('songTitle').textContent = `Fetching ${videoId}...`;
       document.getElementById('songArtist').textContent = 'Querying lyrics providers...';
       document.getElementById('lyricsList').innerHTML = '<div style="text-align:center; padding-top:100px;"><mdui-circular-progress></mdui-circular-progress></div>';
+      loadPreview(videoId);
 
       try {
         let url = `/api/lyrics?v=${videoId}&lang=zh-TW`;
@@ -401,8 +408,10 @@
       </span>`;
 
       currentLyrics = data.lyrics || [];
-      songDuration = currentLyrics.length > 0 ? (currentLyrics[currentLyrics.length - 1].time + 10) : 180;
-      document.getElementById('timeSlider').max = Math.ceil(songDuration);
+      if (!youtubePlayer) {
+        songDuration = currentLyrics.length > 0 ? (currentLyrics[currentLyrics.length - 1].time + 10) : 0;
+        document.getElementById('timeSlider').max = Math.ceil(songDuration || 1);
+      }
 
       if (!currentLyrics || currentLyrics.length === 0) {
         listEl.innerHTML = '<div style="text-align:center; padding-top:100px; opacity:0.6;">No lyrics lines returned</div>';
@@ -410,21 +419,9 @@
       }
 
       listEl.innerHTML = currentLyrics.map((line, idx) => {
-        let textHtml = '';
-        const lineTimeMs = (line.time || 0) * 1000;
-        if (line.parts && line.parts.length > 0) {
-          let prevStart = lineTimeMs;
-          textHtml = line.parts.map((p, pIdx) => {
-            let start = parseFloat(p.startTimeMs || 0);
-            if (start < lineTimeMs) {
-              start = prevStart + (pIdx === 0 ? 0 : 250);
-            }
-            prevStart = start;
-            return `<span class="part-span part-unsung" data-start="${start}">${escapeHtml(p.words || '')}</span>`;
-          }).join('');
-        } else {
-          textHtml = escapeHtml(line.text || '');
-        }
+        // Timing-part data is not reliably word-based (especially for CJK text).
+        // Render the provider's complete line instead of synthesizing karaoke spans.
+        const textHtml = escapeHtml(line.text || '');
         return `
         <div class="lyric-row" id="lyric-${idx}" onclick="seekToLine(${line.time}, ${idx})">
           <div class="time-tag">${formatTime(line.time || 0)}</div>
@@ -440,34 +437,85 @@
     function seekToLine(time, idx) {
       currentSimTime = time;
       document.getElementById('timeSlider').value = currentSimTime;
+      if (youtubePlayer && youtubePlayer.seekTo) youtubePlayer.seekTo(time, true);
       highlightActiveLyric(idx);
       updatePlaybackUI();
     }
 
     function onSeek(val) {
       currentSimTime = parseFloat(val);
+      isSeeking = true;
       syncActiveHighlight();
       updatePlaybackUI();
+      if (youtubePlayer && youtubePlayer.seekTo) youtubePlayer.seekTo(currentSimTime, true);
+      setTimeout(() => { isSeeking = false; }, 150);
     }
 
-    function togglePlaySim() {
-      isPlaying = !isPlaying;
-      const btn = document.getElementById('playSimBtn');
-      if (isPlaying) {
-        btn.icon = 'pause_circle';
-        playbackInterval = setInterval(() => {
-          currentSimTime += 0.5;
-          document.getElementById('timeSlider').value = currentSimTime;
-          syncActiveHighlight();
-          updatePlaybackUI();
-          if (currentSimTime >= songDuration) {
-            togglePlaySim();
-          }
-        }, 500);
-      } else {
-        btn.icon = 'play_circle';
-        clearInterval(playbackInterval);
+    function togglePlayback() {
+      if (!youtubePlayer) {
+        mdui.snackbar({ message: 'Load a YouTube video first' });
+        return;
       }
+      if (isPlaying) youtubePlayer.pauseVideo();
+      else youtubePlayer.playVideo();
+    }
+
+    async function loadPreview(videoId) {
+      pendingVideoId = videoId;
+      await youtubeApiPromise;
+      if (pendingVideoId !== videoId) return;
+      if (youtubePlayer) {
+        youtubePlayer.loadVideoById(videoId);
+      } else {
+        youtubePlayer = new YT.Player('youtubePlayer', {
+          width: '1', height: '1', videoId,
+          playerVars: { autoplay: 0, controls: 0, playsinline: 1, rel: 0 },
+          events: {
+            onReady: event => {
+              document.getElementById('timeSlider').disabled = false;
+              songDuration = event.target.getDuration() || 0;
+              document.getElementById('timeSlider').max = Math.ceil(songDuration || 1);
+              updatePlaybackUI();
+            },
+            onStateChange: event => {
+              isPlaying = event.data === YT.PlayerState.PLAYING;
+              const btn = document.getElementById('playSimBtn');
+              btn.icon = isPlaying ? 'pause_circle' : 'play_circle';
+              if (event.data === YT.PlayerState.ENDED) {
+                currentSimTime = songDuration;
+                updatePlaybackFromPlayer();
+              }
+            },
+            onError: () => {
+              mdui.snackbar({ message: 'YouTube could not play this video' });
+              isPlaying = false;
+              document.getElementById('playSimBtn').icon = 'play_circle';
+            }
+          }
+        });
+        setInterval(updatePlaybackFromPlayer, 250);
+      }
+    }
+
+    function updatePlaybackFromPlayer() {
+      if (!youtubePlayer || !youtubePlayer.getCurrentTime || isSeeking) return;
+      const duration = youtubePlayer.getDuration();
+      if (duration && isFinite(duration)) {
+        songDuration = duration;
+        document.getElementById('timeSlider').max = Math.ceil(duration);
+      }
+      const time = youtubePlayer.getCurrentTime();
+      if (isFinite(time)) {
+        currentSimTime = time;
+        document.getElementById('timeSlider').value = time;
+        syncActiveHighlight();
+        updatePlaybackUI();
+      }
+    }
+
+    /* Kept as an alias for any existing dashboard integrations. */
+    function togglePlaySim() {
+      togglePlayback();
     }
 
     function syncActiveHighlight() {
@@ -494,7 +542,6 @@
     }
 
     function highlightActiveLyric(idx) {
-      const curMs = currentSimTime * 1000;
       const rows = document.querySelectorAll('.lyric-row');
       rows.forEach((row, i) => {
         if (i === idx) {
@@ -503,31 +550,12 @@
             row.classList.remove('past', 'future');
             scrollToLyric(row);
           }
-          // Word-by-word karaoke sync
-          row.querySelectorAll('.part-span').forEach(span => {
-            const startMs = parseFloat(span.getAttribute('data-start') || '0');
-            if (curMs >= startMs) {
-              span.classList.add('part-sung');
-              span.classList.remove('part-unsung');
-            } else {
-              span.classList.add('part-unsung');
-              span.classList.remove('part-sung');
-            }
-          });
         } else if (i < idx) {
           row.classList.remove('active', 'future');
           row.classList.add('past');
-          row.querySelectorAll('.part-span').forEach(span => {
-            span.classList.add('part-sung');
-            span.classList.remove('part-unsung');
-          });
         } else {
           row.classList.remove('active', 'past');
           row.classList.add('future');
-          row.querySelectorAll('.part-span').forEach(span => {
-            span.classList.remove('part-sung');
-            span.classList.add('part-unsung');
-          });
         }
       });
     }

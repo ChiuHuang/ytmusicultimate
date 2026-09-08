@@ -440,7 +440,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleSongChange:) name:@"YTMUSongDidChange" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleLyricsDidLoad:) name:@"YTMULyricsDidLoad" object:nil];
 
-    // Start display link for real-time auto-highlight and word-by-word karaoke
+    // Start display link for real-time line-level lyric highlighting
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updatePlaybackTime)];
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
@@ -702,16 +702,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
                 [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:UITableViewScrollPositionMiddle animated:YES];
             }
         }
-    } else if (self.currentIndex >= 0 && self.currentIndex < self.lyrics.count) {
-        // Line didn't change: update word-by-word karaoke synchronization for the active line
-        NSDictionary *currLyric = self.lyrics[self.currentIndex];
-        NSArray *parts = currLyric[@"parts"];
-        if (parts && parts.count > 0) {
-            YTMULyricsCell *currCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:self.currentIndex inSection:0]];
-            if (currCell) {
-                [self applyWordSyncToCell:currCell lyric:currLyric currentTime:currentTime];
-            }
-        }
+        // The current line remains highlighted until its timestamp changes.
     }
 }
 
@@ -816,89 +807,6 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     return UITableViewAutomaticDimension;
 }
 
-- (void)applyWordSyncToCell:(YTMULyricsCell *)cell lyric:(NSDictionary *)lyric currentTime:(double)currentTime {
-    NSArray *parts = lyric[@"parts"];
-    if (!parts || parts.count == 0) return;
-
-    double currentMs = currentTime * 1000.0;
-    UIFont *font = [UIFont boldSystemFontOfSize:24];
-
-    // --- Smooth left-to-right wipe effect ---
-    // For each word:
-    //   • Before its start: dim (alpha 0.38)
-    //   • After the next word's start: fully lit (alpha 1.0)
-    //   • In between: linearly interpolate, so the "lit" sweep
-    //     flows smoothly across the line rather than popping.
-    //
-    // To make the transition even softer, we define a "feather" window
-    // that starts 50ms before the word's own startTimeMs.
-    //
-    // Result: the bright region grows character-by-character across the line.
-
-    NSMutableAttributedString *attrStr = [[NSMutableAttributedString alloc] init];
-
-    for (NSUInteger idx = 0; idx < parts.count; idx++) {
-        NSDictionary *part = parts[idx];
-        double wordStartMs = [part[@"startTimeMs"] doubleValue];
-        NSString *w = part[@"words"] ?: @"";
-        if (w.length == 0) continue;
-
-        // Build display string with trailing space for Latin words
-        NSString *displayWord = w;
-        if (idx < parts.count - 1 && ![displayWord hasSuffix:@" "]) {
-            NSDictionary *nextPart = parts[idx + 1];
-            NSString *nextWord = nextPart[@"words"] ?: @"";
-            if (![nextWord hasPrefix:@" "]) {
-                BOOL isLatin = NO;
-                for (NSUInteger ci = 0; ci < displayWord.length; ci++) {
-                    if ([displayWord characterAtIndex:ci] < 0x2E80) { isLatin = YES; break; }
-                }
-                if (isLatin) {
-                    displayWord = [displayWord stringByAppendingString:@" "];
-                }
-            }
-        }
-
-        // Compute word-level progress [0..1]
-        // Window: from (wordStartMs - feather) to nextWordStartMs (or wordStartMs+200ms fallback)
-        double nextWordStartMs;
-        if (idx < parts.count - 1) {
-            nextWordStartMs = [parts[idx + 1][@"startTimeMs"] doubleValue];
-        } else {
-            nextWordStartMs = wordStartMs + 250.0; // last word: 250ms window
-        }
-
-        double feather = 60.0; // ms — how early we start brightening before the beat
-        double windowStart = wordStartMs - feather;
-        double windowEnd = nextWordStartMs;
-
-        CGFloat progress; // 0.0 = fully dim, 1.0 = fully lit
-        if (currentMs <= windowStart) {
-            progress = 0.0;
-        } else if (currentMs >= windowEnd) {
-            progress = 1.0;
-        } else {
-            progress = (CGFloat)((currentMs - windowStart) / (windowEnd - windowStart));
-            // Apply a subtle ease-in curve so the wipe accelerates into brightness
-            progress = progress * progress * (3.0 - 2.0 * progress); // smoothstep
-        }
-
-        // Interpolate alpha: 0.38 (dim) → 1.0 (bright)
-        CGFloat dimAlpha = 0.38;
-        CGFloat brightAlpha = 1.0;
-        CGFloat alpha = dimAlpha + progress * (brightAlpha - dimAlpha);
-
-        UIColor *col = [[UIColor whiteColor] colorWithAlphaComponent:alpha];
-        NSDictionary *attrs = @{
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: col
-        };
-        [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:displayWord attributes:attrs]];
-    }
-
-    cell.lyricLabel.attributedText = attrStr;
-}
-
 - (NSString *)normalizedLyricText:(NSString *)raw {
     if (!raw || raw.length == 0) return @"";
     // Collapse multiple consecutive spaces (from word-boundary artefacts) into one
@@ -914,11 +822,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     if (index < 0 || index >= self.lyrics.count) return;
 
     NSDictionary *lyric = self.lyrics[index];
-    NSArray *parts = lyric[@"parts"];
     NSString *displayText = [self normalizedLyricText:lyric[@"text"]];
 
     if (!self.isSynced) {
-        // Plain unsynced lyrics: display every line clearly without dimming or karaoke highlight
+        // Plain unsynced lyrics: display every line clearly without dimming.
         cell.lyricLabel.attributedText = nil;
         cell.lyricLabel.text = displayText;
         cell.lyricLabel.textColor = [UIColor whiteColor];
@@ -930,13 +837,9 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
         cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
     } else if (isActive) {
-        if (parts && parts.count > 0) {
-            [self applyWordSyncToCell:cell lyric:lyric currentTime:currentTime];
-        } else {
-            cell.lyricLabel.attributedText = nil;
-            cell.lyricLabel.text = displayText;
-            cell.lyricLabel.textColor = [UIColor whiteColor];
-        }
+        cell.lyricLabel.attributedText = nil;
+        cell.lyricLabel.text = displayText;
+        cell.lyricLabel.textColor = [UIColor whiteColor];
 
         cell.lyricLabel.layer.shadowColor = [UIColor blackColor].CGColor;
         cell.lyricLabel.layer.shadowOffset = CGSizeMake(0, 1.5);
