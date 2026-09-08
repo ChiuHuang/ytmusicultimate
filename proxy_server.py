@@ -1137,7 +1137,8 @@ def clear_not_found_caches():
 # ============================================================
 
 # Server-side in-flight dedup
-_in_flight = {}  # cache_key -> threading.Event
+_in_flight = {}  # dedup_key -> threading.Event
+_in_flight_lock = threading.Lock()  # protects atomic check-and-register
 import threading
 
 def fetch_fast_lyrics(video_id, song_info, translate_to='zh-TW'):
@@ -1324,51 +1325,87 @@ def api_lyrics():
     jwt_token = request.args.get('jwt')
     fast_mode = request.args.get('fast', '0') == '1'
     force_mode = request.args.get('force', '0') == '1'
-    
+
     print("=" * 60)
     mode_str = 'FAST' if fast_mode else ('JWT+Cohere' if jwt_token else 'Normal')
     if force_mode: mode_str += ' [FORCE]'
     print(f"🌟 Lyrics request: {video_id} [{mode_str}]")
     print("=" * 60)
-    
-    # Separate cache keys for fast vs full results
-    cache_key = f"{video_id}:{translate_to}:fast" if fast_mode else f"{video_id}:{translate_to}"
-    if not force_mode and cache_key in _in_flight:
+
+    # Cache keys — fast and full are stored separately
+    full_cache_key = f"{video_id}:{translate_to}"
+    fast_cache_key = f"{video_id}:{translate_to}:fast"
+    cache_key = fast_cache_key if fast_mode else full_cache_key
+
+    # In-flight dedup key — SAME for fast and full so they share the gate.
+    # This prevents the common case of 8+ simultaneous requests for the same song
+    # (fast + full + multiple VC instances) all running the full pipeline in parallel.
+    dedup_key = f"{video_id}:{translate_to}" if not force_mode else None
+
+    # --- Atomic check-and-register (fixes TOCTOU race) ---
+    wait_event = None
+    if dedup_key:
+        with _in_flight_lock:
+            if dedup_key in _in_flight:
+                # Another request is already doing the work — grab its event to wait on
+                wait_event = _in_flight[dedup_key]
+            else:
+                # First request for this video — register ourselves as in-flight
+                event = threading.Event()
+                _in_flight[dedup_key] = event
+
+    if wait_event is not None:
+        # We're a duplicate — wait for the primary request to finish
         print(f"⏳ Waiting for in-flight request for {video_id}...")
-        _in_flight[cache_key].wait(timeout=30)
-        cached = get_cached(cache_key)
+        wait_event.wait(timeout=30)
+        # Check full cache first (might be better than fast), then fast
+        cached = get_cached(full_cache_key) or get_cached(fast_cache_key)
         if cached:
             print(f"✅ Got result from in-flight wait")
             return jsonify(cached)
-    
-    # Cache check
+        # Fell through (timeout or no cache) — return empty
+        return jsonify({
+            'lyrics': [{'time': 0, 'text': 'No lyrics found', 'translated': '找不到歌詞', 'duration': 0}],
+            'source': 'none', 'synced': False
+        })
+
+    # --- Cache check (only for non-force requests) ---
     if not force_mode:
-        cached = get_cached(cache_key)
+        # Fast mode: accept full result too (full is strictly better)
+        cached = get_cached(full_cache_key) if fast_mode else get_cached(full_cache_key)
+        if not cached:
+            cached = get_cached(cache_key)
         if cached:
             print(f"✅ Cache hit!")
+            # Release in-flight slot immediately (no work needed)
+            if dedup_key:
+                with _in_flight_lock:
+                    if dedup_key in _in_flight:
+                        _in_flight[dedup_key].set()
+                        del _in_flight[dedup_key]
             return jsonify(cached)
-    
-    # Mark as in-flight
-    event = threading.Event()
-    _in_flight[cache_key] = event
-    
-    # Get song info
-    print(f"🔍 Looking up song info...")
-    song_info = get_song_info(video_id)
-    
-    if not song_info:
-        if cache_key in _in_flight:
-            _in_flight[cache_key].set()
-            del _in_flight[cache_key]
-        return jsonify({
-            'lyrics': [{'time': 0, 'text': 'Could not identify song', 'translated': '無法識別歌曲', 'duration': 0}],
-            'source': 'error', 'synced': False
-        })
-    
-    print(f"🎵 {song_info['title']} - {song_info['artist']} ({song_info['duration']}s)")
-    
-    # Fetch lyrics
+
+    # --- We are the primary request: do the actual work ---
+    def release_inflight():
+        if dedup_key:
+            with _in_flight_lock:
+                if dedup_key in _in_flight:
+                    _in_flight[dedup_key].set()
+                    del _in_flight[dedup_key]
+
     try:
+        print(f"🔍 Looking up song info...")
+        song_info = get_song_info(video_id)
+
+        if not song_info:
+            release_inflight()
+            return jsonify({
+                'lyrics': [{'time': 0, 'text': 'Could not identify song', 'translated': '無法識別歌曲', 'duration': 0}],
+                'source': 'error', 'synced': False
+            })
+
+        print(f"🎵 {song_info['title']} - {song_info['artist']} ({song_info['duration']}s)")
+
         if fast_mode:
             result = fetch_fast_lyrics(video_id, song_info, translate_to)
             if not result:
@@ -1378,18 +1415,16 @@ def api_lyrics():
                 }
         else:
             result = fetch_all_lyrics(video_id, song_info, translate_to, jwt_token)
+
     finally:
-        # Always release the in-flight lock
-        if cache_key in _in_flight:
-            _in_flight[cache_key].set()
-            del _in_flight[cache_key]
-    
-    # Cache result (only if real lyrics were found)
+        release_inflight()
+
+    # Cache result
     set_cached(cache_key, result)
-    
+
     print(f"📤 Returning {len(result.get('lyrics', []))} lines from {result.get('source', '?')}")
     print("=" * 60)
-    
+
     return jsonify(result)
 
 

@@ -42,6 +42,10 @@ static double g_currentPlaybackTime = 0.0;
 static NSString *g_currentVideoID = nil;
 static __weak YTPlayerViewController *g_activePlayer = nil;
 static NSMutableDictionary *g_lyricsCache = nil;
+// Global in-flight guard: prevents multiple VC instances from firing parallel
+// requests for the same video. Only one full fetch runs at a time across all VCs.
+static NSString *g_globalLoadingVideoID = nil; // videoID currently being fetched
+static BOOL g_globalLoadingInFlight = NO;      // YES while a full request chain is active
 
 // 輔助工具：把除錯訊息傳給你的 Python 伺服器
 static void sendDebugLog(NSString *msg) {
@@ -415,8 +419,9 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
     self.lyrics = @[];
 
-    // Listen for song changes
+    // Listen for song changes and lyrics updates across instances
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleSongChange:) name:@"YTMUSongDidChange" object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleLyricsDidLoad:) name:@"YTMULyricsDidLoad" object:nil];
 
     // Start display link for real-time auto-highlight and word-by-word karaoke
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updatePlaybackTime)];
@@ -454,6 +459,18 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self.displayLink invalidate];
+}
+
+- (void)handleLyricsDidLoad:(NSNotification *)notif {
+    NSString *videoID = notif.object;
+    NSArray *lyrics = notif.userInfo[@"lyrics"];
+    if (videoID && lyrics && [videoID isEqualToString:g_currentVideoID]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
+            if (statusLabel) statusLabel.text = @"";
+            [self updateLyrics:lyrics];
+        });
+    }
 }
 
 - (void)handleSongChange:(NSNotification *)notif {
@@ -519,6 +536,7 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         g_lyricsCache = [[NSMutableDictionary alloc] init];
     }
 
+    // Cache hit — serve immediately
     if (g_lyricsCache[videoID]) {
         UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
         statusLabel.text = @"";
@@ -526,9 +544,19 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         return;
     }
 
+    // Global in-flight guard: if ANY VC instance is already fetching this video,
+    // skip — we'll receive the result via YTMULyricsDidLoad notification below.
+    if (g_globalLoadingInFlight && [g_globalLoadingVideoID isEqualToString:videoID]) {
+        return;
+    }
+    // Per-instance guard (for the same VC re-entering)
     if (self.isLoading && [self.loadingVideoID isEqualToString:videoID]) {
         return;
     }
+
+    // Claim the global in-flight slot
+    g_globalLoadingInFlight = YES;
+    g_globalLoadingVideoID = videoID;
     self.isLoading = YES;
     self.loadingVideoID = videoID;
 
@@ -545,6 +573,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
                 if (dict && dict[@"lyrics"]) {
                     statusLabel.text = @"";
                     [self updateLyrics:dict[@"lyrics"]];
+                    // Broadcast fast result so other VCs can show something while full loads
+                    [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMULyricsDidLoad"
+                                                                        object:videoID
+                                                                      userInfo:@{@"lyrics": dict[@"lyrics"]}];
                 }
             }
 
@@ -552,6 +584,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
             [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
                 if (![self.loadingVideoID isEqualToString:videoID]) {
                     self.isLoading = NO;
+                    if ([g_globalLoadingVideoID isEqualToString:videoID]) {
+                        g_globalLoadingInFlight = NO;
+                        g_globalLoadingVideoID = nil;
+                    }
                     return;
                 }
 
@@ -563,6 +599,12 @@ static void openLyricsFromViewController(UIViewController *parentVC);
                 [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:fullURL] completionHandler:^(NSData *fullData, NSURLResponse *fullRes, NSError *fullErr) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         self.isLoading = NO;
+                        // Release global in-flight slot
+                        if ([g_globalLoadingVideoID isEqualToString:videoID]) {
+                            g_globalLoadingInFlight = NO;
+                            g_globalLoadingVideoID = nil;
+                        }
+
                         if (![self.loadingVideoID isEqualToString:videoID]) return;
 
                         if (fullData && !fullErr) {
@@ -571,6 +613,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
                                 statusLabel.text = @"";
                                 g_lyricsCache[videoID] = fullDict[@"lyrics"];
                                 [self updateLyrics:fullDict[@"lyrics"]];
+                                // Broadcast full result so all other VCs update too
+                                [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMULyricsDidLoad"
+                                                                                    object:videoID
+                                                                                  userInfo:@{@"lyrics": fullDict[@"lyrics"]}];
                             } else if (!g_lyricsCache[videoID]) {
                                 statusLabel.text = @"⚠️ 找不到歌詞 / No lyrics found";
                                 self.lyrics = @[];
@@ -664,6 +710,8 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     UILabel *statusLabel = [self.tableView.tableHeaderView viewWithTag:8888];
     statusLabel.text = @"🔄 Force Reloading & Retranslating...";
 
+    g_globalLoadingInFlight = YES;
+    g_globalLoadingVideoID = g_currentVideoID;
     self.isLoading = YES;
     self.loadingVideoID = g_currentVideoID;
 
@@ -672,6 +720,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
         if (![self.loadingVideoID isEqualToString:g_currentVideoID]) {
             self.isLoading = NO;
+            if ([g_globalLoadingVideoID isEqualToString:g_currentVideoID]) {
+                g_globalLoadingInFlight = NO;
+                g_globalLoadingVideoID = nil;
+            }
             return;
         }
 
@@ -683,6 +735,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:fullURL] completionHandler:^(NSData *fullData, NSURLResponse *fullRes, NSError *fullErr) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.isLoading = NO;
+                if ([g_globalLoadingVideoID isEqualToString:g_currentVideoID]) {
+                    g_globalLoadingInFlight = NO;
+                    g_globalLoadingVideoID = nil;
+                }
                 if (![self.loadingVideoID isEqualToString:g_currentVideoID]) return;
 
                 if (fullData && !fullErr) {
@@ -692,6 +748,9 @@ static void openLyricsFromViewController(UIViewController *parentVC);
                         if (!g_lyricsCache) g_lyricsCache = [[NSMutableDictionary alloc] init];
                         g_lyricsCache[g_currentVideoID] = fullDict[@"lyrics"];
                         [self updateLyrics:fullDict[@"lyrics"]];
+                        [[NSNotificationCenter defaultCenter] postNotificationName:@"YTMULyricsDidLoad"
+                                                                            object:g_currentVideoID
+                                                                          userInfo:@{@"lyrics": fullDict[@"lyrics"]}];
                     } else {
                         statusLabel.text = @"⚠️ 重譯失敗 / Force failed";
                     }
