@@ -74,6 +74,91 @@ static void sendDebugLog(NSString *msg) {
 }
 %end
 
+// UI Dump Helpers for Screenshot Trigger
+static NSString *dumpViewHierarchy(UIView *view, int indent) {
+    if (!view) return @"";
+    NSMutableString *str = [NSMutableString string];
+    for (int i = 0; i < indent; i++) [str appendString:@"  "];
+    [str appendFormat:@"<%@: %p; frame = (%.1f, %.1f; %.1f, %.1f); hidden = %@; alpha = %.2f; userInteraction = %@",
+        NSStringFromClass([view class]), view,
+        view.frame.origin.x, view.frame.origin.y, view.frame.size.width, view.frame.size.height,
+        view.hidden ? @"YES" : @"NO", view.alpha,
+        view.userInteractionEnabled ? @"YES" : @"NO"];
+    if (view.tag != 0) {
+        [str appendFormat:@"; tag = %ld", (long)view.tag];
+    }
+    if ([view isKindOfClass:[UILabel class]]) {
+        [str appendFormat:@"; text = \"%@\"", ((UILabel *)view).text ?: @""];
+    } else if ([view isKindOfClass:[UIButton class]]) {
+        [str appendFormat:@"; title = \"%@\"", [((UIButton *)view) titleForState:UIControlStateNormal] ?: @""];
+    }
+    if (view.gestureRecognizers.count > 0) {
+        [str appendFormat:@"; gestures = %lu", (unsigned long)view.gestureRecognizers.count];
+    }
+    [str appendString:@">\n"];
+    for (UIView *sub in view.subviews) {
+        [str appendString:dumpViewHierarchy(sub, indent + 1)];
+    }
+    return str;
+}
+
+static NSString *dumpVCHierarchy(UIViewController *vc, int indent) {
+    if (!vc) return @"";
+    NSMutableString *str = [NSMutableString string];
+    for (int i = 0; i < indent; i++) [str appendString:@"  "];
+    [str appendFormat:@"<%@: %p; title = \"%@\"; view = %p; isViewLoaded = %@>\n",
+        NSStringFromClass([vc class]), vc, vc.title ?: @"", vc.isViewLoaded ? vc.view : nil,
+        vc.isViewLoaded ? @"YES" : @"NO"];
+    for (UIViewController *child in vc.childViewControllers) {
+        [str appendString:dumpVCHierarchy(child, indent + 1)];
+    }
+    if (vc.presentedViewController && vc.presentedViewController != vc) {
+        for (int i = 0; i < indent + 1; i++) [str appendString:@"  "];
+        [str appendString:@"[Presented] ->\n"];
+        [str appendString:dumpVCHierarchy(vc.presentedViewController, indent + 2)];
+    }
+    return str;
+}
+
+static void sendUIDump(void) {
+    NSMutableString *dump = [NSMutableString string];
+    [dump appendFormat:@"=== SCREENSHOT UI DUMP at %@ ===\n", [NSDate date]];
+    [dump appendFormat:@"Current VideoID: %@\n", g_currentVideoID ?: @"(none)"];
+    [dump appendFormat:@"Playback Time: %f\n\n", g_currentPlaybackTime];
+
+    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    if (!keyWin) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow || w.rootViewController) { keyWin = w; break; }
+        }
+    }
+
+    [dump appendString:@"--- VIEW CONTROLLER HIERARCHY ---\n"];
+    if (keyWin && keyWin.rootViewController) {
+        [dump appendString:dumpVCHierarchy(keyWin.rootViewController, 0)];
+    }
+
+    [dump appendString:@"\n--- WINDOWS & VIEW HIERARCHY ---\n"];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        [dump appendFormat:@"[WINDOW: %@; frame = (%.1f, %.1f; %.1f, %.1f)]\n",
+            NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height];
+        [dump appendString:dumpViewHierarchy(w, 1)];
+    }
+
+    NSDictionary *payload = @{
+        @"type": @"UI_DUMP",
+        @"request_body": dump
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    if (jsonData) {
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://ytmtranslate.chiuhuang.dev/log"]];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = jsonData;
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req] resume];
+    }
+}
+
 %hook YTAppDelegate
 - (BOOL)application:(id)app didFinishLaunchingWithOptions:(id)options {
     BOOL result = %orig;
@@ -81,12 +166,44 @@ static void sendDebugLog(NSString *msg) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:nil];
     });
+
+    // Register screenshot listener to automatically upload UI structure and diagnostics
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        sendUIDump();
+    }];
+
     return result;
 }
 %end
 
 // Hook 2: 攔截靜態歌詞的 Cell (如果還存在的話)
 %hook YTMLightweightMusicDescriptionShelfCell
+
+- (void)layoutSubviews {
+    %orig;
+
+    UILabel *descriptionLabel = [self valueForKey:@"_descriptionLabel"];
+    if (descriptionLabel) {
+        CGRect f = descriptionLabel.frame;
+        if (f.origin.x < 18) {
+            CGFloat diff = 18 - f.origin.x;
+            f.origin.x = 18;
+            f.size.width = MAX(0, f.size.width - diff);
+            descriptionLabel.frame = f;
+        }
+    }
+
+    if ([self respondsToSelector:@selector(lyrics)] && self.lyrics) {
+        CGRect f = self.lyrics.frame;
+        if (f.origin.x < 18) {
+            CGFloat diff = 18 - f.origin.x;
+            f.origin.x = 18;
+            f.size.width = MAX(0, f.size.width - diff);
+            self.lyrics.frame = f;
+        }
+        self.lyrics.textContainerInset = UIEdgeInsetsMake(0, 4, 0, 4);
+    }
+}
 
 - (void)setRenderer:(id)renderer {
     %orig;
@@ -146,8 +263,49 @@ static void sendDebugLog(NSString *msg) {
 %end
 
 
+@interface YTMULyricsCell : UITableViewCell
+@property (nonatomic, strong) UILabel *lyricLabel;
+@property (nonatomic, strong) UILabel *transLabel;
+@end
 
-#import <objc/runtime.h>
+@implementation YTMULyricsCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+        self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        self.lyricLabel = [[UILabel alloc] init];
+        self.lyricLabel.numberOfLines = 0;
+        self.lyricLabel.font = [UIFont boldSystemFontOfSize:24];
+        self.lyricLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45];
+        self.lyricLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.contentView addSubview:self.lyricLabel];
+
+        self.transLabel = [[UILabel alloc] init];
+        self.transLabel.numberOfLines = 0;
+        self.transLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+        self.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.32];
+        self.transLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.contentView addSubview:self.transLabel];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.lyricLabel.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:12],
+            [self.lyricLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:20],
+            [self.lyricLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-20],
+
+            [self.transLabel.topAnchor constraintEqualToAnchor:self.lyricLabel.bottomAnchor constant:5],
+            [self.transLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:20],
+            [self.transLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-20],
+            [self.transLabel.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-12]
+        ]];
+    }
+    return self;
+}
+
+@end
+
 
 @interface YTMULyricsViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITableView *tableView;
@@ -156,11 +314,13 @@ static void sendDebugLog(NSString *msg) {
 @property (nonatomic, assign) NSInteger currentIndex;
 @property (nonatomic, assign) BOOL isLoading;
 @property (nonatomic, copy) NSString *loadingVideoID;
+@property (nonatomic, strong) UIImageView *artworkImageView;
 @property (nonatomic, strong) UIVisualEffectView *blurView;
 @property (nonatomic, strong) UIView *darkOverlay;
 @property (nonatomic, assign) BOOL isModal;
 - (void)updateLyrics:(NSArray *)newLyrics;
 - (void)fetchLyricsForVideo:(NSString *)videoID;
+- (void)loadArtworkForVideo:(NSString *)videoID;
 - (void)forceReloadLyrics;
 - (void)dismissModal;
 @end
@@ -178,21 +338,27 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     [super viewDidLoad];
 
     self.currentIndex = -1;
-    self.view.backgroundColor = [UIColor clearColor];
+    self.view.backgroundColor = [UIColor blackColor];
 
-    // Background: dark blur effect matching YouTube Music
+    // Background: high-res album artwork with dark blur
+    self.artworkImageView = [[UIImageView alloc] initWithFrame:self.view.bounds];
+    self.artworkImageView.contentMode = UIViewContentModeScaleAspectFill;
+    self.artworkImageView.clipsToBounds = YES;
+    self.artworkImageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view insertSubview:self.artworkImageView atIndex:0];
+
     UIBlurEffect *blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.blurView = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
     self.blurView.frame = self.view.bounds;
     self.blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view insertSubview:self.blurView atIndex:0];
+    [self.view insertSubview:self.blurView aboveSubview:self.artworkImageView];
 
     self.darkOverlay = [[UIView alloc] initWithFrame:self.view.bounds];
-    self.darkOverlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
+    self.darkOverlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.48];
     self.darkOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view insertSubview:self.darkOverlay aboveSubview:self.blurView];
 
-    // Setup UITableView
+    // Setup UITableView with Auto Layout and generous bottom inset
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
@@ -200,10 +366,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.tableView.showsVerticalScrollIndicator = NO;
-    // Disabling estimated heights avoids content offset recalculation jumping to top during scroll
-    self.tableView.estimatedRowHeight = 0;
-    self.tableView.estimatedSectionHeaderHeight = 0;
-    self.tableView.estimatedSectionFooterHeight = 0;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 85.0;
+    self.tableView.contentInset = UIEdgeInsetsMake(60, 0, 350, 0);
+    [self.tableView registerClass:[YTMULyricsCell class] forCellReuseIdentifier:@"YTMULyricsCell"];
 
     // Header for top spacing and status label
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 50)];
@@ -242,10 +408,6 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
     self.tableView.tableHeaderView = header;
 
-    // Footer for generous bottom spacing so the bottom lines can comfortably center
-    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 240)];
-    self.tableView.tableFooterView = footer;
-
     [self.view addSubview:self.tableView];
 
     self.lyrics = @[];
@@ -283,7 +445,49 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     }
 }
 
+- (void)loadArtworkForVideo:(NSString *)videoID {
+    if (!videoID || videoID.length == 0) return;
+
+    NSString *maxURL = [NSString stringWithFormat:@"https://i.ytimg.com/vi/%@/maxresdefault.jpg", videoID];
+    [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:maxURL] completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
+        NSHTTPURLResponse *httpRes = (NSHTTPURLResponse *)res;
+        if (!err && data && httpRes.statusCode == 200) {
+            UIImage *img = [UIImage imageWithData:data];
+            if (img) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([self.loadingVideoID isEqualToString:videoID]) {
+                        [UIView transitionWithView:self.artworkImageView duration:0.4 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
+                            self.artworkImageView.image = img;
+                        } completion:nil];
+                    }
+                });
+                return;
+            }
+        }
+        // Fallback to hqdefault
+        NSString *hqURL = [NSString stringWithFormat:@"https://i.ytimg.com/vi/%@/hqdefault.jpg", videoID];
+        [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:hqURL] completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2) {
+            if (!e2 && d2) {
+                UIImage *img2 = [UIImage imageWithData:d2];
+                if (img2) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if ([self.loadingVideoID isEqualToString:videoID]) {
+                            [UIView transitionWithView:self.artworkImageView duration:0.4 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
+                                self.artworkImageView.image = img2;
+                            } completion:nil];
+                        }
+                    });
+                }
+            }
+        }] resume];
+    }] resume];
+}
+
 - (void)fetchLyricsForVideo:(NSString *)videoID {
+    if (!videoID || videoID.length == 0) return;
+
+    [self loadArtworkForVideo:videoID];
+
     if (!g_lyricsCache) {
         g_lyricsCache = [[NSMutableDictionary alloc] init];
     }
@@ -382,31 +586,32 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         NSInteger oldIndex = self.currentIndex;
         self.currentIndex = newIndex;
 
-        // Directly re-style old and new cells without calling reloadRowsAtIndexPaths
-        // (reloadRows causes UITableView to recalculate heights and reset contentOffset to top!)
+        // Directly re-style old and new cells without reloadRows
         if (oldIndex >= 0 && oldIndex < self.lyrics.count) {
-            UITableViewCell *oldCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:oldIndex inSection:0]];
+            YTMULyricsCell *oldCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:oldIndex inSection:0]];
             if (oldCell) {
                 [self configureCell:oldCell atIndex:oldIndex isActive:NO currentTime:currentTime];
             }
         }
 
         if (newIndex >= 0 && newIndex < self.lyrics.count) {
-            UITableViewCell *newCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:newIndex inSection:0]];
+            YTMULyricsCell *newCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:newIndex inSection:0]];
             if (newCell) {
                 [self configureCell:newCell atIndex:newIndex isActive:YES currentTime:currentTime];
             }
 
-            // Smooth auto-scroll to the middle of the screen
-            NSIndexPath *indexPath = [NSIndexPath indexPathForRow:newIndex inSection:0];
-            [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:UITableViewScrollPositionMiddle animated:YES];
+            // Smooth auto-scroll to the middle of the screen (only if user is not manually scrolling)
+            if (!self.tableView.isDragging && !self.tableView.isDecelerating) {
+                NSIndexPath *indexPath = [NSIndexPath indexPathForRow:newIndex inSection:0];
+                [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:UITableViewScrollPositionMiddle animated:YES];
+            }
         }
     } else if (self.currentIndex >= 0 && self.currentIndex < self.lyrics.count) {
         // Line didn't change: update word-by-word karaoke synchronization for the active line
         NSDictionary *currLyric = self.lyrics[self.currentIndex];
         NSArray *parts = currLyric[@"parts"];
         if (parts && parts.count > 0) {
-            UITableViewCell *currCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:self.currentIndex inSection:0]];
+            YTMULyricsCell *currCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:self.currentIndex inSection:0]];
             if (currCell) {
                 [self applyWordSyncToCell:currCell lyric:currLyric currentTime:currentTime];
             }
@@ -428,6 +633,8 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 
     self.isLoading = YES;
     self.loadingVideoID = g_currentVideoID;
+
+    [self loadArtworkForVideo:g_currentVideoID];
 
     [[YTMUTurnstileManager sharedManager] getJWTTokenWithCompletion:^(NSString *jwt) {
         if (![self.loadingVideoID isEqualToString:g_currentVideoID]) {
@@ -487,12 +694,12 @@ static void openLyricsFromViewController(UIViewController *parentVC);
     return UITableViewAutomaticDimension;
 }
 
-- (void)applyWordSyncToCell:(UITableViewCell *)cell lyric:(NSDictionary *)lyric currentTime:(double)currentTime {
+- (void)applyWordSyncToCell:(YTMULyricsCell *)cell lyric:(NSDictionary *)lyric currentTime:(double)currentTime {
     NSArray *parts = lyric[@"parts"];
     if (!parts || parts.count == 0) return;
 
     double currentMs = currentTime * 1000.0;
-    UIFont *font = [UIFont boldSystemFontOfSize:26];
+    UIFont *font = [UIFont boldSystemFontOfSize:24];
     UIColor *sungColor = [UIColor whiteColor];
     UIColor *unsungColor = [[UIColor whiteColor] colorWithAlphaComponent:0.42];
 
@@ -513,10 +720,10 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:w attributes:attrs]];
     }
 
-    cell.textLabel.attributedText = attrStr;
+    cell.lyricLabel.attributedText = attrStr;
 }
 
-- (void)configureCell:(UITableViewCell *)cell atIndex:(NSInteger)index isActive:(BOOL)isActive currentTime:(double)currentTime {
+- (void)configureCell:(YTMULyricsCell *)cell atIndex:(NSInteger)index isActive:(BOOL)isActive currentTime:(double)currentTime {
     if (index < 0 || index >= self.lyrics.count) return;
 
     NSDictionary *lyric = self.lyrics[index];
@@ -526,61 +733,39 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         if (parts && parts.count > 0) {
             [self applyWordSyncToCell:cell lyric:lyric currentTime:currentTime];
         } else {
-            cell.textLabel.attributedText = nil;
-            cell.textLabel.text = lyric[@"text"] ?: @"";
-            cell.textLabel.textColor = [UIColor whiteColor];
+            cell.lyricLabel.attributedText = nil;
+            cell.lyricLabel.text = lyric[@"text"] ?: @"";
+            cell.lyricLabel.textColor = [UIColor whiteColor];
         }
 
-        // Soft white glow / shadow on active line
-        cell.textLabel.layer.shadowColor = [UIColor colorWithWhite:1.0 alpha:0.75].CGColor;
-        cell.textLabel.layer.shadowOffset = CGSizeZero;
-        cell.textLabel.layer.shadowRadius = 8.0;
-        cell.textLabel.layer.shadowOpacity = 0.85;
-        cell.textLabel.layer.masksToBounds = NO;
+        cell.lyricLabel.layer.shadowColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
+        cell.lyricLabel.layer.shadowOffset = CGSizeZero;
+        cell.lyricLabel.layer.shadowRadius = 6.0;
+        cell.lyricLabel.layer.shadowOpacity = 0.7;
+        cell.lyricLabel.layer.masksToBounds = NO;
 
-        cell.detailTextLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.95];
-        cell.transform = CGAffineTransformMakeScale(1.03, 1.03);
+        cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
     } else {
-        cell.textLabel.attributedText = nil;
-        cell.textLabel.text = lyric[@"text"] ?: @"";
-        cell.textLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45];
-        cell.textLabel.layer.shadowOpacity = 0.0;
+        cell.lyricLabel.attributedText = nil;
+        cell.lyricLabel.text = lyric[@"text"] ?: @"";
+        cell.lyricLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45];
+        cell.lyricLabel.layer.shadowOpacity = 0.0;
 
-        cell.detailTextLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30];
-        cell.transform = CGAffineTransformIdentity;
+        cell.transLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.28];
     }
 
     NSString *translated = lyric[@"translated"];
     if (translated && translated.length > 0) {
-        cell.detailTextLabel.text = translated;
+        cell.transLabel.text = translated;
+        cell.transLabel.hidden = NO;
     } else {
-        cell.detailTextLabel.text = nil;
+        cell.transLabel.text = @"";
+        cell.transLabel.hidden = YES;
     }
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"LyricCell"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"LyricCell"];
-        cell.backgroundColor = [UIColor clearColor];
-
-        // Main lyrics text
-        cell.textLabel.font = [UIFont boldSystemFontOfSize:26];
-        cell.textLabel.numberOfLines = 0;
-        cell.textLabel.textAlignment = NSTextAlignmentLeft;
-
-        // Translation text
-        cell.detailTextLabel.font = [UIFont boldSystemFontOfSize:17];
-        cell.detailTextLabel.numberOfLines = 0;
-        cell.detailTextLabel.textAlignment = NSTextAlignmentLeft;
-
-        // Tap highlight
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        UIView *bgView = [[UIView alloc] init];
-        bgView.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.1];
-        bgView.layer.cornerRadius = 12;
-        cell.selectedBackgroundView = bgView;
-    }
+    YTMULyricsCell *cell = [tableView dequeueReusableCellWithIdentifier:@"YTMULyricsCell" forIndexPath:indexPath];
 
     double currentTime = 0;
     if (g_activePlayer && [g_activePlayer respondsToSelector:@selector(currentVideoMediaTime)]) {
@@ -609,12 +794,12 @@ static void openLyricsFromViewController(UIViewController *parentVC);
         g_currentPlaybackTime = [time doubleValue];
 
         if (oldIndex >= 0 && oldIndex < self.lyrics.count && oldIndex != indexPath.row) {
-            UITableViewCell *oldCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:oldIndex inSection:0]];
+            YTMULyricsCell *oldCell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:oldIndex inSection:0]];
             if (oldCell) {
                 [self configureCell:oldCell atIndex:oldIndex isActive:NO currentTime:g_currentPlaybackTime];
             }
         }
-        UITableViewCell *newCell = [self.tableView cellForRowAtIndexPath:indexPath];
+        YTMULyricsCell *newCell = [self.tableView cellForRowAtIndexPath:indexPath];
         if (newCell) {
             [self configureCell:newCell atIndex:indexPath.row isActive:YES currentTime:g_currentPlaybackTime];
         }
@@ -624,23 +809,48 @@ static void openLyricsFromViewController(UIViewController *parentVC);
 @end
 
 
+static UIViewController *topMostViewController(void) {
+    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    if (!keyWin) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow || w.rootViewController) { keyWin = w; break; }
+        }
+    }
+    UIViewController *top = keyWin.rootViewController;
+    while (top.presentedViewController) {
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
 static void openLyricsFromViewController(UIViewController *parentVC) {
+    if (!parentVC) {
+        parentVC = topMostViewController();
+    }
+
     // 1. Try opening native engagement panel if available
     if (g_activeEngagementPanelContainer) {
         if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:animated:)]) {
             [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:animated:) withObject:@"PAmusic_watch_lyrics_panel" withObject:(id)kCFBooleanTrue];
-            return;
         } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(showEngagementPanelWithIdentifier:)]) {
             [g_activeEngagementPanelContainer performSelector:@selector(showEngagementPanelWithIdentifier:) withObject:@"PAmusic_watch_lyrics_panel"];
-            return;
         } else if ([g_activeEngagementPanelContainer respondsToSelector:@selector(openEngagementPanelWithIdentifier:animated:)]) {
             [g_activeEngagementPanelContainer performSelector:@selector(openEngagementPanelWithIdentifier:animated:) withObject:@"PAmusic_watch_lyrics_panel" withObject:(id)kCFBooleanTrue];
-            return;
         }
     }
 
-    // 2. Fallback: present YTMULyricsViewController directly as a bottom modal sheet
-    if (parentVC) {
+    // 2. Fallback check: if native panel didn't open within 0.25s, present YTMULyricsViewController as bottom sheet
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIViewController *presenter = parentVC ?: topMostViewController();
+        if (!presenter) return;
+
+        if ([presenter.presentedViewController isKindOfClass:[YTMULyricsViewController class]]) return;
+
+        UIView *existingPanel = [presenter.view viewWithTag:9999];
+        if (existingPanel && !existingPanel.hidden && existingPanel.superview) {
+            return;
+        }
+
         YTMULyricsViewController *lyricsVC = [[YTMULyricsViewController alloc] init];
         lyricsVC.isModal = YES;
         lyricsVC.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -652,8 +862,8 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
         if (g_currentVideoID) {
             [lyricsVC fetchLyricsForVideo:g_currentVideoID];
         }
-        [parentVC presentViewController:lyricsVC animated:YES completion:nil];
-    }
+        [presenter presentViewController:lyricsVC animated:YES completion:nil];
+    });
 }
 
 
@@ -823,7 +1033,12 @@ static void openLyricsFromViewController(UIViewController *parentVC) {
 - (void)ytmu_makeLyricsViewClickable:(UIView *)v {
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)v;
-        if ([lbl.text containsString:@"沒有歌詞"] || [lbl.text containsString:@"歌詞"] || [lbl.text containsString:@"Lyrics"]) {
+        if ([lbl.text containsString:@"沒有歌詞"] || [lbl.text containsString:@"歌詞"] || [lbl.text containsString:@"Lyrics"] || [lbl.text containsString:@"unavailable"]) {
+            lbl.userInteractionEnabled = YES;
+            if (lbl.gestureRecognizers.count == 0) {
+                UITapGestureRecognizer *tapLbl = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ytmu_didTapLyricsBar:)];
+                [lbl addGestureRecognizer:tapLbl];
+            }
             UIView *container = lbl.superview;
             if (container && container.gestureRecognizers.count == 0) {
                 container.userInteractionEnabled = YES;
