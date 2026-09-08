@@ -38,89 +38,78 @@
     .lyrics-container {
       height: 520px;
       overflow-y: auto;
-      background: rgba(var(--mdui-color-surface-container-highest), 0.25);
+      background: rgba(0, 0, 0, 0.25);
       border-radius: 16px;
       padding: 24px 16px;
       scroll-behavior: smooth;
     }
     .lyric-row {
-      padding: 12px 18px;
-      border-radius: 14px;
-      margin-bottom: 8px;
-      transition: all 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+      padding: 12px 16px;
+      border-radius: 12px;
+      margin-bottom: 6px;
+      transition: all 0.25s ease;
       cursor: pointer;
-      opacity: 0.4;
-      transform: scale(0.97);
-      transform-origin: left center;
-      border-left: 4px solid transparent;
+      opacity: 0.35;
     }
     .lyric-row:hover {
-      opacity: 0.85;
-      background: rgba(255, 255, 255, 0.04);
+      opacity: 0.8;
+      background: rgba(255, 255, 255, 0.05);
     }
     .lyric-row.past {
-      opacity: 0.55;
-      transform: scale(0.97);
+      opacity: 0.45;
     }
     .lyric-row.future {
-      opacity: 0.35;
-      transform: scale(0.96);
+      opacity: 0.3;
     }
     .lyric-row.active {
       opacity: 1;
-      transform: scale(1.02);
-      background: rgba(var(--mdui-color-primary), 0.16);
-      border-left: 4px solid rgb(var(--mdui-color-primary));
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      background: rgba(255, 255, 255, 0.08);
     }
     .lyric-row.active .orig-text {
       color: #ffffff;
-      font-size: 19px;
+      font-size: 18px;
       font-weight: 700;
-      text-shadow: 0 0 16px rgba(255, 255, 255, 0.75), 0 0 32px rgba(255, 64, 129, 0.45);
     }
     .lyric-row.active .trans-text {
-      opacity: 0.95;
-      color: #ff80ab;
-      font-weight: 500;
-      font-size: 15px;
+      opacity: 0.85;
+      color: rgba(255, 255, 255, 0.75);
+      font-weight: 400;
+      font-size: 14px;
     }
     .part-span {
       display: inline;
-      transition: color 0.15s ease, text-shadow 0.18s ease;
+      transition: color 0.12s ease;
     }
     .part-sung {
       color: #ffffff;
       font-weight: 700;
-      text-shadow: 0 0 14px rgba(255, 255, 255, 0.9), 0 0 24px rgba(255, 64, 129, 0.5);
     }
     .part-unsung {
       color: rgba(255, 255, 255, 0.35);
-      text-shadow: none;
+      font-weight: 700;
     }
     .lyric-row.past .part-sung {
-      color: rgba(255, 255, 255, 0.65);
-      text-shadow: none;
+      color: rgba(255, 255, 255, 0.5);
     }
     .lyric-row .time-tag {
       font-size: 11px;
-      opacity: 0.5;
+      opacity: 0.4;
       font-family: monospace;
       margin-bottom: 2px;
     }
     .lyric-row .orig-text {
       font-size: 16px;
       font-weight: 600;
-      line-height: 1.35;
-      color: rgb(var(--mdui-color-on-surface));
-      transition: all 0.3s ease;
+      line-height: 1.4;
+      color: rgba(255, 255, 255, 0.9);
+      transition: color 0.2s ease, font-size 0.2s ease;
     }
     .lyric-row .trans-text {
-      font-size: 14px;
-      opacity: 0.6;
-      color: rgb(var(--mdui-color-secondary));
-      margin-top: 4px;
-      transition: all 0.3s ease;
+      font-size: 13px;
+      opacity: 0.5;
+      color: rgba(255, 255, 255, 0.6);
+      margin-top: 3px;
+      transition: opacity 0.2s ease;
     }
     .log-box {
       background: #0d1117;
@@ -422,8 +411,17 @@
 
       listEl.innerHTML = currentLyrics.map((line, idx) => {
         let textHtml = '';
+        const lineTimeMs = (line.time || 0) * 1000;
         if (line.parts && line.parts.length > 0) {
-          textHtml = line.parts.map((p, pIdx) => `<span class="part-span part-unsung" data-start="${p.startTimeMs}">${escapeHtml(p.words || '')}</span>`).join('');
+          let prevStart = lineTimeMs;
+          textHtml = line.parts.map((p, pIdx) => {
+            let start = parseFloat(p.startTimeMs || 0);
+            if (start < lineTimeMs) {
+              start = prevStart + (pIdx === 0 ? 0 : 250);
+            }
+            prevStart = start;
+            return `<span class="part-span part-unsung" data-start="${start}">${escapeHtml(p.words || '')}</span>`;
+          }).join('');
         } else {
           textHtml = escapeHtml(line.text || '');
         }

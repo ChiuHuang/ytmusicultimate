@@ -865,6 +865,15 @@ def get_cached(video_id):
             data = entry.get('data')
             if is_not_found_result(data):
                 return None
+            if data and data.get('lyrics'):
+                for l in data['lyrics']:
+                    if l.get('parts'):
+                        l_ms = int(l.get('time', 0) * 1000)
+                        prev_ms = l_ms
+                        for pi, p in enumerate(l['parts']):
+                            if not p.get('startTimeMs') or p['startTimeMs'] < l_ms:
+                                p['startTimeMs'] = prev_ms + (0 if pi == 0 else 250)
+                            prev_ms = p['startTimeMs']
             ts = datetime.fromisoformat(entry['ts'])
             if (datetime.now() - ts).total_seconds() < 86400 * 3:
                 return data
